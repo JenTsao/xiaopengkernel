@@ -12,6 +12,18 @@ else()
     set(MINGW_BUILD FALSE)
 endif()
 
+# Copy MinGW runtime DLLs next to the executables: the exe directory wins the
+# Windows DLL search order, so tests run even when an older toolchain's
+# libstdc++-6.dll shadows ours on PATH (0xc0000139 entry-point failures).
+if(MINGW_BUILD)
+    get_filename_component(XPK_MINGW_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    foreach(XPK_RUNTIME_DLL libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll)
+        if(EXISTS "${XPK_MINGW_BIN}/${XPK_RUNTIME_DLL}")
+            file(COPY "${XPK_MINGW_BIN}/${XPK_RUNTIME_DLL}" DESTINATION "${CMAKE_SOURCE_DIR}/bin")
+        endif()
+    endforeach()
+endif()
+
 # CURL Configuration - support both MinGW bundled and Linux system library
 if(MINGW_BUILD)
     set(CURL_ROOT "${CMAKE_SOURCE_DIR}/third_party/curl")
