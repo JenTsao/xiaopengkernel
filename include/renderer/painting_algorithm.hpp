@@ -29,8 +29,8 @@ private:
   PaintLayerPtr buildLayerTree(layout::LayoutBoxPtr root);
   void collectLayers(layout::LayoutBoxPtr box, PaintLayerPtr currentLayer);
   
-  void paintLayer(PaintLayerPtr layer, Canvas &canvas, int parentX, int parentY);
-  void paintNormalFlow(layout::LayoutBoxPtr box, Canvas &canvas, int parentX, int parentY, PaintPhase phase);
+  void paintLayer(PaintLayerPtr layer, Canvas &canvas);
+  void paintNormalFlow(layout::LayoutBoxPtr box, Canvas &canvas, PaintPhase phase);
   void paintBox(layout::LayoutBoxPtr box, Canvas &canvas, int parentBorderBoxX, int parentBorderBoxY, PaintPhase phase);
   void getParentBorderBox(layout::LayoutBoxPtr box, int& px, int& py);
 

@@ -32,7 +32,7 @@ void PageLifecycleManager::addEventListener(PageLifecycleEvent event,
 }
 
 void PageLifecycleManager::removeEventListener(PageLifecycleEvent event,
-                                               EventCallback callback) {
+                                               EventCallback) {
   // Note: This is a simplified implementation that doesn't handle
   // exact callback matching (since std::function isn't comparable)
   auto it = m_listeners.find(event);

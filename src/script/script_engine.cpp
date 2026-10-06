@@ -45,7 +45,7 @@ bool ScriptEngine::initialize() {
   TimerBinding::registerBinding(m_ctx);
   DOMBinding::registerBinding(m_ctx);
 
-  dom::EventSystem::setEventDispatchCallback([this](dom::NodePtr node, const std::shared_ptr<dom::Event> &event, dom::EventPhase phase) {
+  dom::EventSystem::setEventDispatchCallback([this](dom::NodePtr node, const std::shared_ptr<dom::Event> &event, dom::EventPhase) {
     if (!this->m_ctx || !node) return;
     const auto *listenerIds = node->getEventListeners(event->type());
     if (listenerIds && !listenerIds->empty()) {

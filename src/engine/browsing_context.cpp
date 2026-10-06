@@ -84,7 +84,7 @@ void BrowsingContext::navigate(const std::string &url) {
   firePopStateEvent("");
 }
 
-void BrowsingContext::firePopStateEvent(const std::string &state_str) {
+void BrowsingContext::firePopStateEvent(const std::string &) {
   // Currently, just a placeholder.
   // In a real implementation, we'd dispatch an event to m_eventTarget.
 }

@@ -226,10 +226,10 @@ private:
     }
 
     // Calculate column sizes - simplified auto-sizing
-    calculateAutoTrackSizes(columnTracks, items, containerWidth, columnGap, true);
+    calculateAutoTrackSizes(columnTracks, items, true);
 
     // Calculate row sizes - simplified auto-sizing
-    calculateAutoTrackSizes(rowTracks, items, containerHeight, rowGap, false);
+    calculateAutoTrackSizes(rowTracks, items, false);
 
     // Distribute flexible space (fr units)
     distributeFlexibleSpace(columnTracks, containerWidth, columnGap);
@@ -242,8 +242,6 @@ private:
 
   void calculateAutoTrackSizes(std::vector<TrackInfo>& tracks,
                               const std::vector<GridItem>& items,
-                              float containerSize,
-                              float gap,
                               bool isColumns) {
     // For each auto track, calculate content-based size
     for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {

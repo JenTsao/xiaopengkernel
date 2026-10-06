@@ -17,7 +17,7 @@ void PaintingAlgorithm::paint(layout::LayoutBoxPtr root, Canvas &canvas) {
   canvas.clear(Color::White());
 
   auto rootLayer = buildLayerTree(root);
-  paintLayer(rootLayer, canvas, 0, 0);
+  paintLayer(rootLayer, canvas);
 }
 
 PaintLayerPtr PaintingAlgorithm::buildLayerTree(layout::LayoutBoxPtr root) {
@@ -54,7 +54,7 @@ void PaintingAlgorithm::getParentBorderBox(layout::LayoutBoxPtr box, int& px, in
   py = pContentAbsY - static_cast<int>(pDims.padding.top) - static_cast<int>(pDims.border.top);
 }
 
-void PaintingAlgorithm::paintLayer(PaintLayerPtr layer, Canvas &canvas, int dummyX, int dummyY) {
+void PaintingAlgorithm::paintLayer(PaintLayerPtr layer, Canvas &canvas) {
   layer->sortNegZOrderList();
   layer->sortPosZOrderList();
 
@@ -67,34 +67,34 @@ void PaintingAlgorithm::paintLayer(PaintLayerPtr layer, Canvas &canvas, int dumm
 
   // 2. Paint child layers with negative z-index
   for (const auto &childLayer : layer->negZOrderList()) {
-    paintLayer(childLayer, canvas, 0, 0);
+    paintLayer(childLayer, canvas);
   }
 
   // 3. Paint normal flow children block backgrounds and borders
   for (const auto &childBox : layer->normalFlowChildren()) {
     if (!childBox->isFloat() && childBox->style().position == css::Position::Static) {
-      paintNormalFlow(childBox, canvas, 0, 0, PaintPhase::BackgroundAndBorders);
+      paintNormalFlow(childBox, canvas, PaintPhase::BackgroundAndBorders);
     }
   }
 
   // 4. Paint floats
   for (const auto &childBox : layer->normalFlowChildren()) {
     if (childBox->isFloat()) {
-      paintNormalFlow(childBox, canvas, 0, 0, PaintPhase::Both);
+      paintNormalFlow(childBox, canvas, PaintPhase::Both);
     }
   }
 
   // 5. Paint normal flow inline foregrounds (text and replaced elements)
   for (const auto &childBox : layer->normalFlowChildren()) {
     if (!childBox->isFloat() && childBox->style().position == css::Position::Static) {
-      paintNormalFlow(childBox, canvas, 0, 0, PaintPhase::Foreground);
+      paintNormalFlow(childBox, canvas, PaintPhase::Foreground);
     }
   }
 
   // 6. Paint positioned elements with z-index auto or 0
   for (const auto &childBox : layer->normalFlowChildren()) {
     if (childBox->style().position != css::Position::Static) {
-      paintNormalFlow(childBox, canvas, 0, 0, PaintPhase::Both);
+      paintNormalFlow(childBox, canvas, PaintPhase::Both);
     }
   }
 
@@ -103,11 +103,11 @@ void PaintingAlgorithm::paintLayer(PaintLayerPtr layer, Canvas &canvas, int dumm
 
   // 8. Paint child layers with positive (or zero) z-index
   for (const auto &childLayer : layer->posZOrderList()) {
-    paintLayer(childLayer, canvas, 0, 0);
+    paintLayer(childLayer, canvas);
   }
 }
 
-void PaintingAlgorithm::paintNormalFlow(layout::LayoutBoxPtr box, Canvas &canvas, int dummyX, int dummyY, PaintPhase phase) {
+void PaintingAlgorithm::paintNormalFlow(layout::LayoutBoxPtr box, Canvas &canvas, PaintPhase phase) {
   int px = 0, py = 0;
   getParentBorderBox(box, px, py);
   paintBox(box, canvas, px, py, phase);
@@ -262,8 +262,6 @@ void PaintingAlgorithm::paintBox(layout::LayoutBoxPtr box, Canvas &canvas,
 
     // --- 4. Paint Inline Text Lines ---
     if (!box->lineBoxes().empty()) {
-      auto textCol = toColor(style.color);
-
       for (const auto &line : box->lineBoxes()) {
         int lineAbsY = borderBoxY + static_cast<int>(line.y());
 
@@ -275,7 +273,6 @@ void PaintingAlgorithm::paintBox(layout::LayoutBoxPtr box, Canvas &canvas,
                          static_cast<int>(dims.padding.left) +
                          static_cast<int>(frag.x);
           int fragAbsY = lineAbsY + static_cast<int>(frag.y);
-          int baselineY = fragAbsY + static_cast<int>(frag.baseline);
 
           const std::string &textContent = frag.box->node()->textContent();
           if (frag.startOffset < textContent.length()) {
