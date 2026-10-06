@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/jencaoking/xiaopengkernel/actions/workflows/ci.yml"><img src="https://github.com/jencaoking/xiaopengkernel/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=c%2B%2B&logoColor=white" alt="C++20" />
   <img src="https://img.shields.io/badge/CMake-3.15%2B-064F8C?logo=cmake&logoColor=white" alt="CMake" />
   <img src="https://img.shields.io/badge/Version-v0.4.0--dev-orange" alt="Version" />
@@ -255,7 +256,7 @@ cd build && ctest . --output-on-failure
 
 ## 🧭 当前状态与 v1.0 路线图
 
-> 以下评估基于对源码（约 2 万行核心 C++，不含 QuickJS 等第三方依赖）的静态分析，详见 [`analysis_results.md`](analysis_results.md)。
+> 以下评估基于对源码（约 2 万行核心 C++，不含 QuickJS 等第三方依赖）的静态分析。
 
 项目已搭建一个非常完整且规范的现代浏览器引擎骨架，但距离能渲染大部分现代网页（如简单 Vue / React 站点）的"正式版"仍需填补以下核心差距：
 
