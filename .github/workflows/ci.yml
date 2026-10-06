@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ "main", "master" ]
 
+# 同一分支的新推送会取消仍在运行的旧构建
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     name: Build on ${{ matrix.os }}
@@ -62,12 +67,13 @@ jobs:
     # --- 配置 CMake ---
     - name: Configure CMake (Linux)
       if: runner.os == 'Linux'
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/.cmake-deps
+      # ENABLE_FREETYPE=ON 使 FreeType/HarfBuzz 矢量字体代码路径纳入 CI 测试
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_FREETYPE=ON -DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/.cmake-deps
 
     - name: Configure CMake (Windows MinGW)
       if: runner.os == 'Windows'
-      # 在 Windows 下使用 MinGW Makefiles 并通过选项启用 third_party 依赖
-      run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DUSE_THIRD_PARTY=ON -DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/.cmake-deps
+      # Windows 下使用 MinGW Makefiles，依赖由 third_party/ 打包提供
+      run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DENABLE_FREETYPE=ON -DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/.cmake-deps
 
     # --- 执行构建 ---
     - name: Build
