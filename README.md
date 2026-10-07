@@ -85,7 +85,7 @@ xiaopengkernel/
 │   ├── script/         # JS 脚本绑定（DOM / 事件 / 定时器 / Promise）
 │   └── window/         # 窗口管理（SDL2 / 鼠标事件）
 ├── src/                # 源代码（20 个 .cpp）
-├── tests/              # 单元测试（24 个测试文件，100+ 用例）
+├── tests/              # 单元测试（25 个测试文件，100+ 用例）
 ├── demo/               # 演示页面（flexbox / grid / image / showcase）
 ├── docs/               # API 文档（Loader / DOM / 脚本引擎）
 ├── third_party/        # 第三方依赖（curl / SDL2 / FreeType / HarfBuzz / QuickJS）
@@ -177,7 +177,7 @@ int main() {
 | 模块 | 状态 | 说明 |
 |------|------|------|
 | **HTML 解析器** | ✅ 完整 | WHATWG 规范状态机，65 个解析状态，字符引用解码 |
-| **CSS 解析器** | ✅ 基础 | 选择器解析、属性选择器、伪类 / 伪元素 |
+| **CSS 解析器** | ✅ 完善 | 选择器解析、属性选择器、伪类 / 伪元素、样式继承、简写展开、CSS 变量、em/rem 单位 |
 | **DOM 树** | ✅ 完整 | Element / Document / TextNode / Comment 及完整 API |
 | **布局引擎** | ✅ 进阶 | Block / Inline / Flexbox / Grid，BFC / IFC 混合排版 |
 | **层叠上下文** | ✅ 完整 | CSS 2.1 层叠规则，z-index 排序，PaintLayer 图层管理 |
@@ -193,7 +193,11 @@ int main() {
 - 完整 WHATWG 规范 HTML 词法分析器（65 个状态）+ 树构建器（23+ 插入模式）
 - CSS 选择器：Tag、Class、Id、Attribute、Pseudo-class、Pseudo-element
 - 属性选择器运算符：`=`、`~=`、`|=`、`^=`、`$=`、`*=`
-- 伪类：`:first-child`、`:last-child`、`:nth-child`、`:first-of-type`、`:lang()`、`:not()` 等
+- 伪类：`:first-child`、`:last-child`、`:nth-child`、`:first-of-type`、`:lang()`、`:not()`、`:is()`、`:where()`、`:has()` 等
+- 样式继承：color / font 系 / text 系等可继承属性自动从父级传递，`inherit` / `initial` / `unset` 关键字
+- 简写展开：`margin` / `padding` / `border-width` / `border-color`（1–4 值）、`overflow`（双值）、`flex`、`background`（颜色分量）
+- 单位：px / % / em / rem（em 相对自身或父级 font-size，rem 相对根字号）
+- CSS 变量：`--custom-property` 定义 + `var()` 引用与 fallback
 
 **2. 布局引擎**
 - Block 布局：完整盒模型，margin / padding / border 计算，BFC 隔离
