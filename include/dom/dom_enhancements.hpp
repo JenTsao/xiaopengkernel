@@ -174,7 +174,9 @@ DocumentFragment::querySelector(const std::string &selector) const {
 
 inline void Element::setInnerHTML(const std::string &html) {
   removeAllChildren();
-  for (const auto &node : HtmlParser::parseFragment(html)) {
+  // Parse in the context of this element so fragments like "<td>x</td>"
+  // or "<option>..." land with the right insertion mode
+  for (const auto &node : HtmlParser::parseFragment(html, detail::elementPtrFrom(this))) {
     appendChild(node);
   }
 }
@@ -184,7 +186,14 @@ inline void Element::setOuterHTML(const std::string &html) {
   if (!parent)
     return;
   auto self = shared_from_this();
-  for (const auto &node : HtmlParser::parseFragment(html)) {
+  ElementPtr parseContext;
+  if (parent->nodeType() == NodeType::Element) {
+    parseContext = std::static_pointer_cast<Element>(parent);
+  } else {
+    parseContext = detail::elementPtrFrom(this);
+  }
+  auto nodes = HtmlParser::parseFragment(html, parseContext);
+  for (const auto &node : nodes) {
     parent->insertBefore(node, self);
   }
   parent->removeChild(self);
@@ -192,7 +201,17 @@ inline void Element::setOuterHTML(const std::string &html) {
 
 inline void Element::insertAdjacentHTML(const std::string &position,
                                         const std::string &html) {
-  for (const auto &node : HtmlParser::parseFragment(html)) {
+  std::string pos = toLower(position);
+  // beforebegin/afterend parse in the parent's context (per spec the
+  // parent must exist; without one we keep this element as context)
+  ElementPtr parseContext = detail::elementPtrFrom(this);
+  if (pos == "beforebegin" || pos == "afterend") {
+    if (auto parent = parentElement()) {
+      parseContext = parent;
+    }
+  }
+  auto nodes = HtmlParser::parseFragment(html, parseContext);
+  for (const auto &node : nodes) {
     detail::insertAdjacentNodeAt(this, position, node);
   }
 }

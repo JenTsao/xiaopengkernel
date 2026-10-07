@@ -1627,13 +1627,10 @@ public:
   // element.innerHTML setter
   static JSValue element_set_innerHTML(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv) {
-    dom::Element *el = (dom::Element *)JS_GetOpaque(this_val, s_elementClassId);
+    dom::Element *el = getElementFromThis(ctx, this_val);
     if (!el || argc < 1) return JS_EXCEPTION;
-    el->removeAllChildren();
-    auto nodes = dom::HtmlParser::parseFragment(JSBinding::toStdString(ctx, argv[0]));
-    for (const auto &node : nodes) {
-      el->appendChild(node);
-    }
+    // setInnerHTML parses the fragment in this element's context
+    el->setInnerHTML(JSBinding::toStdString(ctx, argv[0]));
     return JS_UNDEFINED;
   }
 

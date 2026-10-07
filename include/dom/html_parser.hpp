@@ -99,6 +99,18 @@ public:
     return {};
   }
 
+  // Fragment parsing relative to a context element (WHATWG fragment case).
+  // The context element determines the insertion mode, so fragments like
+  // "<td>...</td>" parse correctly against a tr context.
+  static std::vector<std::shared_ptr<Node>>
+  parseFragment(const std::string &html,
+                const std::shared_ptr<Element> &context,
+                const ParserOptions &options = {}) {
+    (void)options;
+    HtmlTreeBuilder builder;
+    return builder.buildFragment(html, context);
+  }
+
   void setOptions(const ParserOptions &options) { options_ = options; }
   const ParserOptions &options() const { return options_; }
 

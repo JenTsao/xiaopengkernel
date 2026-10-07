@@ -55,6 +55,13 @@ public:
   std::shared_ptr<Document> build(const std::string &html);
   std::shared_ptr<Document> build(const loader::ByteBuffer &html);
 
+  // WHATWG fragment parsing: parse html with the given context element
+  // (e.g. a "td" or "tr" so table fragments parse correctly). The context is
+  // cloned into an internal document; the newly parsed children of the clone
+  // are returned as detached nodes ready to be adopted by the caller.
+  std::vector<std::shared_ptr<Node>>
+  buildFragment(const std::string &html, const ElementPtr &context);
+
   void setErrorCallback(ErrorCallback callback) {
     errorCallback_ = std::move(callback);
   }
@@ -159,6 +166,7 @@ private:
   static bool isRawTextTagName(const std::string &tagName);
   static bool isEscapableRawTextTagName(const std::string &tagName);
   static bool isBasicTagName(const std::string &tagName);
+  static InsertionMode insertionModeForContext(const std::string &tagName);
 
   std::shared_ptr<Document> document_;
   std::vector<StackItem> stack_;
@@ -238,6 +246,77 @@ inline std::shared_ptr<Document>
 HtmlTreeBuilder::build(const loader::ByteBuffer &html) {
   HtmlTokenizer tokenizer(html);
   return build(tokenizer);
+}
+
+inline HtmlTreeBuilder::InsertionMode
+HtmlTreeBuilder::insertionModeForContext(const std::string &tagName) {
+  if (tagName == "select")
+    return InsertionMode::InSelect;
+  if (tagName == "td" || tagName == "th")
+    return InsertionMode::InCell;
+  if (tagName == "tr")
+    return InsertionMode::InRow;
+  if (tagName == "tbody" || tagName == "thead" || tagName == "tfoot")
+    return InsertionMode::InTableBody;
+  if (tagName == "caption")
+    return InsertionMode::InCaption;
+  if (tagName == "colgroup" || tagName == "col")
+    return InsertionMode::InColumnGroup;
+  if (tagName == "table")
+    return InsertionMode::InTable;
+  if (tagName == "head" || tagName == "noscript")
+    return InsertionMode::InHead;
+  if (tagName == "frameset")
+    return InsertionMode::InFrameset;
+  return InsertionMode::InBody;
+}
+
+inline std::vector<std::shared_ptr<Node>>
+HtmlTreeBuilder::buildFragment(const std::string &html,
+                               const ElementPtr &context) {
+  // Fresh state (same reset sequence as build())
+  document_ = std::make_shared<Document>();
+  stack_.clear();
+  templateStack_.clear();
+  activeFormattingElements_.clear();
+  insertionMode_ = InsertionMode::Initial;
+  originalInsertionMode_ = InsertionMode::Initial;
+  headElement_.reset();
+  formElement_.reset();
+  framesetOk_ = true;
+  quirksMode_ = false;
+  stopParsing_ = false;
+  fosterParenting_ = false;
+  errors_.clear();
+
+  // Bootstrap html + body like a document parse would
+  insertHtmlElement();
+  insertBodyElement();
+
+  auto body = document_->body();
+  auto contextClone = std::dynamic_pointer_cast<Element>(
+      context ? context->cloneNode(false) : nullptr);
+  if (!body || !contextClone) {
+    return {};
+  }
+
+  body->appendChild(contextClone);
+  Token contextToken = Token::makeStartTag(contextClone->localName());
+  pushStack(contextClone, contextToken);
+  insertionMode_ =
+      insertionModeForContext(toLower(contextClone->localName()));
+  originalInsertionMode_ = InsertionMode::InBody;
+
+  HtmlTokenizer tokenizer(html);
+  auto tokens = tokenizer.tokenize();
+  for (const auto &token : tokens) {
+    if (stopParsing_)
+      break;
+    processToken(token);
+  }
+
+  auto children = contextClone->childNodes();
+  return std::vector<std::shared_ptr<Node>>(children.begin(), children.end());
 }
 
 inline void HtmlTreeBuilder::processToken(const Token &token) {
