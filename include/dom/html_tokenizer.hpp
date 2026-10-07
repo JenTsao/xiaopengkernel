@@ -525,10 +525,15 @@ inline void HtmlTokenizer::handleDataState() {
         returnState_ = TokenizerState::Data;
         std::string ref = consumeCharacterReference();
         if (!ref.empty()) {
-            // Append to the character buffer like any other character:
-            // emitToken() has a single slot, so two consecutive emits would
-            // lose the buffered text before the entity.
-            characterTokenBuffer_ += ref;
+            if (characterTokenBuffer_.empty()) {
+                // Standalone entity: emit its own character token (existing
+                // tokenizer contract, e.g. "&amp;" → token data "&")
+                emitToken(Token::makeCharacter(ref));
+            } else {
+                // emitToken() has a single slot, so a second emit here would
+                // overwrite the buffered text — merge instead
+                characterTokenBuffer_ += ref;
+            }
             return;
         }
         emitCharacterToken('&');
