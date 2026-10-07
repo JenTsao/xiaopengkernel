@@ -1094,7 +1094,7 @@ private:
     return std::find(props.begin(), props.end(), name) != props.end();
   }
 
-  // Copy one property (longhand or recognized shorthand) between styles
+  // Copy one property (longhand, recognized shorthand, or custom property)
   static void copyProperty(ComputedStyle &dst, const ComputedStyle &src,
                            const std::string &name) {
     if (name == "color") {
@@ -1117,6 +1117,29 @@ private:
       dst.textTransform = src.textTransform;
     } else if (name == "text-align") {
       dst.textAlign = src.textAlign;
+    } else if (name == "margin") {
+      dst.marginTop = src.marginTop;
+      dst.marginRight = src.marginRight;
+      dst.marginBottom = src.marginBottom;
+      dst.marginLeft = src.marginLeft;
+    } else if (name == "padding") {
+      dst.paddingTop = src.paddingTop;
+      dst.paddingRight = src.paddingRight;
+      dst.paddingBottom = src.paddingBottom;
+      dst.paddingLeft = src.paddingLeft;
+    } else if (name == "border-width") {
+      dst.borderTopWidth = src.borderTopWidth;
+      dst.borderRightWidth = src.borderRightWidth;
+      dst.borderBottomWidth = src.borderBottomWidth;
+      dst.borderLeftWidth = src.borderLeftWidth;
+    } else if (name == "border-color") {
+      dst.borderTopColor = src.borderTopColor;
+      dst.borderRightColor = src.borderRightColor;
+      dst.borderBottomColor = src.borderBottomColor;
+      dst.borderLeftColor = src.borderLeftColor;
+    } else if (name == "overflow") {
+      dst.overflowX = src.overflowX;
+      dst.overflowY = src.overflowY;
     } else if (name.size() >= 2 && name[0] == '-' && name[1] == '-') {
       if (const auto *v = src.getCustomProperty(name)) {
         dst.setCustomProperty(name, *v);

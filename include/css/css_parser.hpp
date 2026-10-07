@@ -324,6 +324,8 @@ private:
                 args += ",";
               } else if (arg.is(TokenType::Ident) || arg.is(TokenType::Delim)) {
                 args += arg.value;
+              } else if (arg.is(TokenType::Hash)) {
+                args += "#" + arg.value;
               } else if (arg.is(TokenType::Number)) {
                 args += formatNumber(arg.numberValue);
               } else if (arg.is(TokenType::Percentage)) {
@@ -478,6 +480,10 @@ private:
             decl.value += arg.value;
           } else if (arg.is(TokenType::Delim)) {
             decl.value += arg.value;
+          } else if (arg.is(TokenType::Hash)) {
+            decl.value += "#" + arg.value;
+          } else if (arg.is(TokenType::String)) {
+            decl.value += "\"" + arg.value + "\"";
           }
         }
         if (peek().is(TokenType::CloseParen)) {
