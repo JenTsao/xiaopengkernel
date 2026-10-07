@@ -424,7 +424,7 @@ TEST(Text_SplitText) {
   auto first = std::static_pointer_cast<TextNode>(doc->createTextNode("abcdef"));
   p->appendChild(first);
 
-  auto rest = first->splitText(3);
+  auto rest = std::static_pointer_cast<TextNode>(first->splitText(3));
   EXPECT_STREQ(first->data().c_str(), "abc");
   EXPECT_STREQ(rest->data().c_str(), "def");
   EXPECT_TRUE(rest->parentNode() == p);
