@@ -68,7 +68,8 @@ selectDescendants(const NodePtr &root,
 }
 
 inline ElementPtr elementPtrFrom(const Element *element) {
-  return const_cast<Element *>(element)->shared_from_this();
+  return std::static_pointer_cast<Element>(
+      const_cast<Element *>(element)->shared_from_this());
 }
 
 // Insert a node relative to elem per the insertAdjacent* positions
@@ -102,12 +103,12 @@ inline bool insertAdjacentNodeAt(Element *elem, const std::string &position,
 // ── Element: selector APIs ───────────────────────────────────
 
 inline bool Element::matches(const std::string &selector) const {
-  auto selectors = css::parseSelectorList(selector);
+  auto selectors = css::CssParser::parseSelectorList(selector);
   return detail::matchesSelectorList(detail::elementPtrFrom(this), selectors);
 }
 
 inline ElementPtr Element::closest(const std::string &selector) const {
-  auto selectors = css::parseSelectorList(selector);
+  auto selectors = css::CssParser::parseSelectorList(selector);
   if (selectors.empty())
     return nullptr;
   ElementPtr current = detail::elementPtrFrom(this);
@@ -121,7 +122,7 @@ inline ElementPtr Element::closest(const std::string &selector) const {
 
 inline std::vector<ElementPtr>
 Element::querySelectorAll(const std::string &selector) const {
-  auto selectors = css::parseSelectorList(selector);
+  auto selectors = css::CssParser::parseSelectorList(selector);
   if (selectors.empty())
     return {};
   // The element itself is not a candidate (WHATWG: descendants only)
@@ -138,7 +139,7 @@ inline ElementPtr Element::querySelector(const std::string &selector) const {
 
 inline std::vector<ElementPtr>
 Document::querySelectorAll(const std::string &selector) const {
-  auto selectors = css::parseSelectorList(selector);
+  auto selectors = css::CssParser::parseSelectorList(selector);
   if (selectors.empty())
     return {};
   // Walk from the document node so documentElement is a candidate
@@ -155,7 +156,7 @@ inline ElementPtr Document::querySelector(const std::string &selector) const {
 
 inline std::vector<ElementPtr>
 DocumentFragment::querySelectorAll(const std::string &selector) const {
-  auto selectors = css::parseSelectorList(selector);
+  auto selectors = css::CssParser::parseSelectorList(selector);
   if (selectors.empty())
     return {};
   return detail::selectDescendants(

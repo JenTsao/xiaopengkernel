@@ -1435,13 +1435,14 @@ public:
   // ── element.dataset (get/set/has/delete/keys over data-* attributes) ──
 
   static dom::Element *datasetElement(JSContext *ctx, JSValueConst this_val) {
+    // The dataset object holds the element's JS wrapper under "__el";
+    // the wrapper's opaque carries the Element* (old QuickJS lacks
+    // JS_GetBigUint64, so we can't round-trip the raw pointer).
     JSValue elVal = JS_GetPropertyStr(ctx, this_val, "__el");
-    uint64_t ptr = 0;
-    int rc = JS_GetBigUint64(ctx, elVal, &ptr);
+    dom::Element *el =
+        (dom::Element *)JS_GetOpaque(elVal, s_elementClassId);
     JS_FreeValue(ctx, elVal);
-    if (rc < 0 || ptr == 0)
-      return nullptr;
-    return (dom::Element *)(uintptr_t)ptr;
+    return el;
   }
 
   // element.dataset (getter): object with get/set/has/delete/keys
@@ -1451,9 +1452,8 @@ public:
     dom::Element *el = getElementFromThis(ctx, this_val);
     if (!el) return JS_EXCEPTION;
     JSValue obj = JS_NewObject(ctx);
-    // Keep the element pointer reachable for the dataset methods
-    JS_SetPropertyStr(ctx, obj, "__el",
-                      JS_NewBigUint64(ctx, (uint64_t)(uintptr_t)el));
+    // Keep the element's wrapper reachable for the dataset methods
+    JS_SetPropertyStr(ctx, obj, "__el", JS_DupValue(ctx, this_val));
     auto bind = [&](const char *name, JSCFunction func, int n) {
       JS_SetPropertyStr(ctx, obj, name, JS_NewCFunction(ctx, func, name, n));
     };
