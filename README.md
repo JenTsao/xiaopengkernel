@@ -73,7 +73,7 @@ XiaopengKernel 采用清晰的分层管线设计：输入 HTML 经过解析层�
 
 ```
 xiaopengkernel/
-├── include/            # 头文件目录（68 个 .hpp）
+├── include/            # 头文件目录（69 个 .hpp）
 │   ├── css/            # CSS 解析与样式
 │   ├── dom/            # DOM 树构建
 │   ├── engine/         # 浏览器引擎核心（BrowserEngine / 事件循环 / 浏览上下文）
@@ -85,7 +85,7 @@ xiaopengkernel/
 │   ├── script/         # JS 脚本绑定（DOM / 事件 / 定时器 / Promise）
 │   └── window/         # 窗口管理（SDL2 / 鼠标事件）
 ├── src/                # 源代码（20 个 .cpp）
-├── tests/              # 单元测试（23 个测试文件，100+ 用例）
+├── tests/              # 单元测试（24 个测试文件，100+ 用例）
 ├── demo/               # 演示页面（flexbox / grid / image / showcase）
 ├── docs/               # API 文档（Loader / DOM / 脚本引擎）
 ├── third_party/        # 第三方依赖（curl / SDL2 / FreeType / HarfBuzz / QuickJS）
@@ -210,11 +210,17 @@ int main() {
 
 **4. JavaScript 集成（QuickJS）**
 - Document API：`body` / `head` / `title` / `URL` / `readyState`、资源提取
-- 创建方法：`createElement` / `createTextNode` / `createDocumentFragment`
-- Node 遍历：`parentNode` / `childNodes` / `children` / `nextSibling`
+- 创建方法：`createElement` / `createTextNode` / `createDocumentFragment` / `createComment` / `createProcessingInstruction`
+- Node 遍历：`parentNode` / `childNodes` / `children` / `nextSibling` / `isConnected`
 - classList API：`add` / `remove` / `toggle` / `contains` / `replace`
-- DOM 操作：`insertBefore` / `replaceChild` / `remove` / `cloneNode`
-- 事件：`addEventListener` / `removeEventListener` / `dispatchEvent`
+- DOM 操作：`insertBefore` / `replaceChild` / `remove` / `cloneNode` / `isEqualNode`
+- 树变更（ParentNode / ChildNode）：`append` / `prepend` / `replaceChildren` / `before` / `after` / `replaceWith`
+- 选择器引擎：`querySelector` / `querySelectorAll` / `matches` / `closest`，支持组合器（后代 ` `、子 `>`、兄弟 `+` / `~`）、属性运算符（`=`、`~=`、`|=`、`^=`、`$=`、`*=`）与伪类（`:nth-child`、`:not()` 等）
+- 片段操作：`innerHTML` / `outerHTML`（读+写）、`insertAdjacentHTML` / `insertAdjacentText` / `insertAdjacentElement`
+- 属性扩展：`getAttributeNames` / `hasAttributes` / `toggleAttribute(force)` / `dataset`（data-* 映射）
+- 文本：`splitText`、CharacterData API（`substringData` / `appendData` / `insertData` / `deleteData` / `replaceData`）
+- Document 扩展：`importNode` / `adoptNode` / `getElementsByName`
+- 事件：`addEventListener` / `removeEventListener` / `dispatchEvent`，支持 capture 标记与捕获→目标→冒泡阶段过滤
 - 定时器：`setTimeout` / `setInterval` / `clearTimeout` / `clearInterval`
 
 **5. 网络加载**

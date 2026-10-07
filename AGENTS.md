@@ -18,9 +18,9 @@
 
 ## 仓库结构
 
-- `include/`（68 个 .hpp）— **绝大多数实现是 header-only**：CSS/DOM 解析、布局算法（Block/Inline/Flex/Grid）、层叠上下文、Loader 层都在这里
+- `include/`（69 个 .hpp）— **绝大多数实现是 header-only**：CSS/DOM 解析、布局算法（Block/Inline/Flex/Grid）、层叠上下文、Loader 层都在这里
 - `src/`（20 个 .cpp）— 引擎入口（`main.cpp`、`demo_minimal_main.cpp`）、SDL 窗口、渲染器、脚本绑定、事件循环等需要独立编译单元的部分
-- `tests/`（23 个 .cpp）— 自研极简测试框架 `test_framework.hpp` + 各模块测试，经 CTest 管理（18 个测试目标）
+- `tests/`（24 个 .cpp）— 自研极简测试框架 `test_framework.hpp` + 各模块测试，经 CTest 管理（19 个测试目标）
 - `third_party/` — Windows/MinGW 预编译依赖（curl、SDL2、QuickJS、FreeType、HarfBuzz），**不要修改第三方代码**
 - `demo/`、`docs/` — 演示页面与 API 文档
 
