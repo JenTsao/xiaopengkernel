@@ -24,7 +24,7 @@ public:
 
     if (node->nodeType() == dom::NodeType::Element) {
       if (auto element = std::dynamic_pointer_cast<dom::Element>(node)) {
-        style = resolver_.resolveStyle(element, sheet_);
+        style = resolver_.resolveStyle(element, sheet_, parentStyle);
         display = style.display;
 
         // <img> intrinsic sizing: read HTML width/height attributes

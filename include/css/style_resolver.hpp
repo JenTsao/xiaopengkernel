@@ -2,12 +2,14 @@
 
 #include "../dom/dom.hpp"
 #include "computed_style.hpp"
+#include "css_parser.hpp"
 #include "css_types.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace xiaopeng {
@@ -23,8 +25,23 @@ class StyleResolver {
 public:
   StyleResolver() = default;
 
+  void setRootFontSize(float px) { rootFontSize_ = px > 0.0f ? px : 16.0f; }
+
   ComputedStyle resolveStyle(dom::ElementPtr element, const StyleSheet &sheet) {
+    return resolveStyle(element, sheet, nullptr);
+  }
+
+  // parentStyle enables CSS inheritance: properties that are inheritable and
+  // not explicitly declared fall back to the parent's computed values.
+  ComputedStyle resolveStyle(dom::ElementPtr element, const StyleSheet &sheet,
+                             const ComputedStyle *parentStyle) {
     ComputedStyle style;
+
+    // Custom properties inherit wholesale; the element's own declarations
+    // (applied below) override the inherited ones.
+    if (parentStyle) {
+      style.customProperties = parentStyle->customProperties;
+    }
 
     // 1. Collect matching rules
     std::vector<MatchResult> matches;
@@ -47,15 +64,35 @@ public:
                 return a.position < b.position;
               });
 
+    // Track explicitly declared properties (for inheritance semantics)
+    std::unordered_set<std::string> declared;
+    for (const auto &match : matches) {
+      for (const auto &d : match.rule->declarations) {
+        declared.insert(d.property);
+      }
+    }
+
     // 3. Apply non-important declarations first (sorted by specificity)
     for (const auto &match : matches) {
-      applyDeclarations(style, match.rule->declarations, false);
+      applyDeclarations(style, match.rule->declarations, false, parentStyle);
     }
 
     // 4. Apply !important declarations last (they always override non-important)
     for (const auto &match : matches) {
-      applyDeclarations(style, match.rule->declarations, true);
+      applyDeclarations(style, match.rule->declarations, true, parentStyle);
     }
+
+    // 5. Inheritable properties that were not declared come from the parent
+    if (parentStyle) {
+      for (const auto &name : inheritedProperties()) {
+        if (declared.count(name) == 0) {
+          copyProperty(style, *parentStyle, name);
+        }
+      }
+    }
+
+    // 6. Resolve relative units (em/rem) against the computed font sizes
+    resolveRelativeUnits(style);
 
     return style;
   }
@@ -276,6 +313,14 @@ private:
       return element->isLink();
     } else if (name == "visited") {
       return element->isVisited();
+    } else if (name.compare(0, 3, "is(") == 0) {
+      // :is(selector-list) — full selector engine matching
+      return matchInnerSelectorList(element, pseudoFunctionArgs(name));
+    } else if (name.compare(0, 6, "where(") == 0) {
+      // :where(selector-list) — same matching, zero specificity contribution
+      return matchInnerSelectorList(element, pseudoFunctionArgs(name));
+    } else if (name.compare(0, 4, "has(") == 0) {
+      return matchHasRelative(element, pseudoFunctionArgs(name));
     }
 
     // Phase 2: enhanced pseudo-classes (first-of-type, last-of-type,
@@ -511,7 +556,8 @@ private:
 
   void applyDeclarations(ComputedStyle &style,
                          const std::vector<Declaration> &decls,
-                         bool importantOnly = false) {
+                         bool importantOnly,
+                         const ComputedStyle *parentStyle = nullptr) {
     for (const auto &decl : decls) {
       // Skip declarations that don't match the important filter
       if (decl.important != importantOnly) continue;
@@ -519,6 +565,26 @@ private:
       // Resolve CSS variables (var()) before parsing values
       std::string resolvedValue = resolveCSSVariable(decl.value, style);
       const std::string& value = resolvedValue;
+
+      // CSS-wide keywords (inherit / initial / unset)
+      if (value == "inherit" || value == "initial" || value == "unset") {
+        if (value == "inherit") {
+          if (parentStyle) {
+            copyProperty(style, *parentStyle, decl.property);
+          }
+        } else if (value == "initial") {
+          ComputedStyle defaultValue;
+          copyProperty(style, defaultValue, decl.property);
+        } else { // unset: inherit for inherited properties, else initial
+          if (isInheritedProperty(decl.property) && parentStyle) {
+            copyProperty(style, *parentStyle, decl.property);
+          } else {
+            ComputedStyle defaultValue;
+            copyProperty(style, defaultValue, decl.property);
+          }
+        }
+        continue;
+      }
 
       if (decl.property == "display") {
         if (value == "none")
@@ -541,14 +607,22 @@ private:
         style.color = parseColor(value);
       } else if (decl.property == "background-color") {
         style.backgroundColor = parseColor(value);
+      } else if (decl.property == "background") {
+        // Shorthand: only the color component is extracted; other layers
+        // (images, gradients) are kept as raw strings.
+        if (looksLikeColor(value)) {
+          style.backgroundColor = parseColor(value);
+        } else {
+          style.otherProperties["background"] = value;
+        }
       } else if (decl.property == "margin") {
-        auto l = parseLength(value);
-        style.marginTop = style.marginRight = style.marginBottom =
-            style.marginLeft = l;
+        // 1-4 value shorthand (TRBL)
+        applyBoxLengths(style.marginTop, style.marginRight, style.marginBottom,
+                        style.marginLeft, splitCssValues(value));
       } else if (decl.property == "padding") {
-        auto l = parseLength(value);
-        style.paddingTop = style.paddingRight = style.paddingBottom =
-            style.paddingLeft = l;
+        applyBoxLengths(style.paddingTop, style.paddingRight,
+                        style.paddingBottom, style.paddingLeft,
+                        splitCssValues(value));
       } else if (decl.property == "margin-top") {
         style.marginTop = parseLength(value);
       } else if (decl.property == "margin-right") {
@@ -566,7 +640,10 @@ private:
       } else if (decl.property == "padding-left") {
         style.paddingLeft = parseLength(value);
       } else if (decl.property == "font-size") {
-        style.fontSize = parseLength(value);
+        // em/% are relative to the parent's computed font size
+        float parentPx =
+            parentStyle ? computedFontSizePx(*parentStyle) : rootFontSize_;
+        style.fontSize = parseFontLength(value, parentPx);
       } else if (decl.property == "font-family") {
         style.fontFamily = value;
       } else if (decl.property == "line-height") {
@@ -610,15 +687,23 @@ private:
           }
         }
       } else if (decl.property == "letter-spacing") {
-        if (value == "normal")
+        if (value == "normal") {
           style.letterSpacing = 0.0f;
-        else
-          style.letterSpacing = parseLength(value).value;
+        } else {
+          auto l = parseLength(value);
+          style.letterSpacing = (l.unit == Length::Unit::Em)
+                                    ? l.value * computedFontSizePx(style)
+                                    : l.value;
+        }
       } else if (decl.property == "word-spacing") {
-        if (value == "normal")
+        if (value == "normal") {
           style.wordSpacing = 0.0f;
-        else
-          style.wordSpacing = parseLength(value).value;
+        } else {
+          auto l = parseLength(value);
+          style.wordSpacing = (l.unit == Length::Unit::Em)
+                                  ? l.value * computedFontSizePx(style)
+                                  : l.value;
+        }
       } else if (decl.property == "text-decoration-line") {
         if (value == "underline")
           style.textDecorationLine = TextDecorationLine::Underline;
@@ -676,6 +761,40 @@ private:
         style.flexShrink = f;
       } else if (decl.property == "flex-basis") {
         style.flexBasis = parseLength(value);
+      } else if (decl.property == "flex") {
+        // Shorthand: none | auto | <grow> [<shrink> | <basis>]* 
+        auto parts = splitCssValues(value);
+        if (!parts.empty()) {
+          if (parts.size() == 1 && parts[0] == "none") {
+            style.flexGrow = 0.0f;
+            style.flexShrink = 0.0f;
+            style.flexBasis = Length::Auto();
+          } else if (parts.size() == 1 && parts[0] == "auto") {
+            style.flexGrow = 1.0f;
+            style.flexShrink = 1.0f;
+            style.flexBasis = Length::Auto();
+          } else {
+            try {
+              style.flexGrow = std::stof(parts[0]);
+            } catch (...) {}
+            style.flexShrink = 1.0f;
+            style.flexBasis = Length::Percent(0);
+            bool sawShrink = false;
+            for (size_t i = 1; i < parts.size(); ++i) {
+              const std::string &part = parts[i];
+              bool isNumber =
+                  part.find_first_not_of("0123456789.-") == std::string::npos;
+              if (!sawShrink && isNumber) {
+                try {
+                  style.flexShrink = std::stof(part);
+                  sawShrink = true;
+                } catch (...) {}
+              } else {
+                style.flexBasis = parseLength(part);
+              }
+            }
+          }
+        }
       } else if (decl.property.substr(0, 2) == "--") {
         // CSS Custom Properties (CSS Variables)
         std::string varName = decl.property;
@@ -717,13 +836,13 @@ private:
           }
         }
       } else if (decl.property == "border-width") {
-        auto l = parseLength(value);
-        style.borderTopWidth = style.borderRightWidth =
-            style.borderBottomWidth = style.borderLeftWidth = l;
+        applyBoxLengths(style.borderTopWidth, style.borderRightWidth,
+                        style.borderBottomWidth, style.borderLeftWidth,
+                        splitCssValues(value));
       } else if (decl.property == "border-color") {
-        auto c = parseColor(value);
-        style.borderTopColor = style.borderRightColor =
-            style.borderBottomColor = style.borderLeftColor = c;
+        applyBoxColors(style.borderTopColor, style.borderRightColor,
+                       style.borderBottomColor, style.borderLeftColor,
+                       splitCssValues(value));
       } else if (decl.property == "border-left-width") {
         style.borderLeftWidth = parseLength(value);
       } else if (decl.property == "border-right-width") {
@@ -764,7 +883,12 @@ private:
           overflowVal = Overflow::Auto;
         
         if (decl.property == "overflow") {
-          style.overflowX = style.overflowY = overflowVal;
+          // 1-2 value shorthand: <x> [ / <y> | <y> ]
+          auto parts = splitCssValues(value);
+          style.overflowX = parseOverflow(parts.empty() ? "visible" : parts[0]);
+          style.overflowY = parseOverflow(
+              parts.size() > 1 ? parts[1]
+                               : (parts.empty() ? "visible" : parts[0]));
         } else if (decl.property == "overflow-x") {
           style.overflowX = overflowVal;
         } else {
@@ -952,6 +1076,308 @@ private:
     }
   }
 
+private:
+  float rootFontSize_ = 16.0f;
+
+  // ── Inheritance / CSS-wide keyword helpers ──────────────────
+
+  static const std::vector<std::string> &inheritedProperties() {
+    static const std::vector<std::string> props = {
+        "color",       "font-family",    "font-size",     "line-height",
+        "text-indent", "white-space",    "letter-spacing", "word-spacing",
+        "text-transform", "text-align"};
+    return props;
+  }
+
+  static bool isInheritedProperty(const std::string &name) {
+    auto &props = inheritedProperties();
+    return std::find(props.begin(), props.end(), name) != props.end();
+  }
+
+  // Copy one property (longhand or recognized shorthand) between styles
+  static void copyProperty(ComputedStyle &dst, const ComputedStyle &src,
+                           const std::string &name) {
+    if (name == "color") {
+      dst.color = src.color;
+    } else if (name == "font-family") {
+      dst.fontFamily = src.fontFamily;
+    } else if (name == "font-size") {
+      dst.fontSize = src.fontSize;
+    } else if (name == "line-height") {
+      dst.lineHeight = src.lineHeight;
+    } else if (name == "text-indent") {
+      dst.textIndent = src.textIndent;
+    } else if (name == "white-space") {
+      dst.whiteSpace = src.whiteSpace;
+    } else if (name == "letter-spacing") {
+      dst.letterSpacing = src.letterSpacing;
+    } else if (name == "word-spacing") {
+      dst.wordSpacing = src.wordSpacing;
+    } else if (name == "text-transform") {
+      dst.textTransform = src.textTransform;
+    } else if (name == "text-align") {
+      dst.textAlign = src.textAlign;
+    } else if (name.size() >= 2 && name[0] == '-' && name[1] == '-') {
+      if (const auto *v = src.getCustomProperty(name)) {
+        dst.setCustomProperty(name, *v);
+      }
+    }
+  }
+
+  // ── Shorthand helpers ───────────────────────────────────────
+
+  // Split a declaration value on top-level whitespace (parens are respected,
+  // so rgb(1, 2, 3) stays one token)
+  static std::vector<std::string> splitCssValues(const std::string &value) {
+    std::vector<std::string> parts;
+    std::string current;
+    int parenDepth = 0;
+    for (char c : value) {
+      if (c == '(') {
+        parenDepth++;
+      } else if (c == ')') {
+        parenDepth--;
+      }
+      if (parenDepth == 0 &&
+          (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '/')) {
+        if (!current.empty()) {
+          parts.push_back(current);
+          current.clear();
+        }
+      } else {
+        current += c;
+      }
+    }
+    if (!current.empty()) {
+      parts.push_back(current);
+    }
+    return parts;
+  }
+
+  void applyBoxLengths(Length &top, Length &right, Length &bottom,
+                       Length &left, const std::vector<std::string> &parts) {
+    if (parts.empty())
+      return;
+    if (parts.size() == 1) {
+      top = right = bottom = left = parseLength(parts[0]);
+    } else if (parts.size() == 2) {
+      top = bottom = parseLength(parts[0]);
+      right = left = parseLength(parts[1]);
+    } else if (parts.size() == 3) {
+      top = parseLength(parts[0]);
+      right = left = parseLength(parts[1]);
+      bottom = parseLength(parts[2]);
+    } else {
+      top = parseLength(parts[0]);
+      right = parseLength(parts[1]);
+      bottom = parseLength(parts[2]);
+      left = parseLength(parts[3]);
+    }
+  }
+
+  void applyBoxColors(Color &top, Color &right, Color &bottom, Color &left,
+                      const std::vector<std::string> &parts) {
+    if (parts.empty())
+      return;
+    if (parts.size() == 1) {
+      top = right = bottom = left = parseColor(parts[0]);
+    } else if (parts.size() == 2) {
+      top = bottom = parseColor(parts[0]);
+      right = left = parseColor(parts[1]);
+    } else if (parts.size() == 3) {
+      top = parseColor(parts[0]);
+      right = left = parseColor(parts[1]);
+      bottom = parseColor(parts[2]);
+    } else {
+      top = parseColor(parts[0]);
+      right = parseColor(parts[1]);
+      bottom = parseColor(parts[2]);
+      left = parseColor(parts[3]);
+    }
+  }
+
+  static Overflow parseOverflow(const std::string &value) {
+    if (value == "hidden")
+      return Overflow::Hidden;
+    if (value == "scroll")
+      return Overflow::Scroll;
+    if (value == "auto")
+      return Overflow::Auto;
+    return Overflow::Visible;
+  }
+
+  static bool looksLikeColor(const std::string &value) {
+    if (value.empty())
+      return false;
+    if (value[0] == '#')
+      return true;
+    if (value.compare(0, 4, "rgb(") == 0 || value.compare(0, 5, "rgba(") == 0 ||
+        value.compare(0, 4, "hsl(") == 0 || value.compare(0, 5, "hsla(") == 0)
+      return true;
+    static const std::unordered_set<std::string> kNamed = {
+        "red",    "green",  "blue",    "black",  "white",   "transparent",
+        "gray",   "grey",   "cyan",    "magenta", "yellow", "orange",
+        "purple", "pink",   "brown",   "navy",   "teal",    "olive",
+        "silver", "lime",   "aqua",    "fuchsia", "maroon"};
+    return kNamed.count(value) > 0;
+  }
+
+  // ── Relative unit helpers ───────────────────────────────────
+
+  // Best-effort px value of a style's font-size (used as em base)
+  static float computedFontSizePx(const ComputedStyle &style) {
+    if (style.fontSize.unit == Length::Unit::Px)
+      return style.fontSize.value;
+    if (style.fontSize.unit == Length::Unit::Percent)
+      return 16.0f * style.fontSize.value / 100.0f;
+    return 16.0f;
+  }
+
+  // font-size parser: em/% are relative to the parent font size
+  Length parseFontLength(const std::string &val, float parentPx) {
+    if (val == "inherit" || val.empty())
+      return Length::Px(16.0f);
+    float f = 0.0f;
+    try {
+      f = std::stof(val);
+    } catch (const std::exception &) {
+      return Length::Px(16.0f);
+    }
+    if (val.find("%") != std::string::npos)
+      return Length::Px(parentPx * f / 100.0f);
+    if (val.find("rem") != std::string::npos)
+      return Length::Px(rootFontSize_ * f);
+    if (val.find("em") != std::string::npos)
+      return Length::Px(parentPx * f);
+    return Length::Px(f);
+  }
+
+  // Convert remaining em/rem lengths to px after declarations are applied
+  void resolveRelativeUnits(ComputedStyle &style) {
+    float fontPx = 16.0f;
+    if (style.fontSize.unit == Length::Unit::Px) {
+      fontPx = style.fontSize.value;
+    } else if (style.fontSize.unit == Length::Unit::Em) {
+      fontPx = style.fontSize.value * 16.0f;
+      style.fontSize = Length::Px(fontPx);
+    } else if (style.fontSize.unit == Length::Unit::Rem) {
+      fontPx = style.fontSize.value * rootFontSize_;
+      style.fontSize = Length::Px(fontPx);
+    } else if (style.fontSize.unit == Length::Unit::Percent) {
+      fontPx = 16.0f * style.fontSize.value / 100.0f;
+      style.fontSize = Length::Px(fontPx);
+    }
+
+    Length *lengths[] = {
+        &style.width,         &style.height,
+        &style.minWidth,      &style.maxWidth,
+        &style.minHeight,     &style.maxHeight,
+        &style.marginTop,     &style.marginRight,
+        &style.marginBottom,  &style.marginLeft,
+        &style.paddingTop,    &style.paddingRight,
+        &style.paddingBottom, &style.paddingLeft,
+        &style.borderTopWidth,  &style.borderRightWidth,
+        &style.borderBottomWidth, &style.borderLeftWidth,
+        &style.top,           &style.right,
+        &style.bottom,        &style.left,
+        &style.textIndent,    &style.flexBasis,
+        &style.gridColumnGap, &style.gridRowGap};
+    for (Length *l : lengths) {
+      if (l->unit == Length::Unit::Em) {
+        *l = Length::Px(l->value * fontPx);
+      } else if (l->unit == Length::Unit::Rem) {
+        *l = Length::Px(l->value * rootFontSize_);
+      }
+    }
+  }
+
+  // ── :is() / :where() / :has() helpers ───────────────────────
+
+  static std::string pseudoFunctionArgs(const std::string &name) {
+    size_t open = name.find('(');
+    size_t close = name.find_last_of(')');
+    if (open == std::string::npos || close == std::string::npos ||
+        close <= open + 1)
+      return "";
+    return name.substr(open + 1, close - open - 1);
+  }
+
+  bool matchInnerSelectorList(dom::ElementPtr element,
+                              const std::string &list) {
+    auto selectors = CssParser::parseSelectorList(list);
+    if (selectors.empty())
+      return false;
+    for (const auto &selector : selectors) {
+      if (matchSelector(element, selector))
+        return true;
+    }
+    return false;
+  }
+
+  // :has(rel) with descendant (default), child (>), next-sibling (+) and
+  // subsequent-sibling (~) relations
+  bool matchHasRelative(dom::ElementPtr element, const std::string &relation) {
+    std::string rel = dom::trimWhitespace(relation);
+    if (rel.empty())
+      return false;
+
+    char combinator = ' ';
+    std::string rest = rel;
+    if (rel[0] == '>' || rel[0] == '+' || rel[0] == '~') {
+      combinator = rel[0];
+      rest = dom::trimWhitespace(rel.substr(1));
+    }
+    if (rest.empty())
+      return false;
+
+    auto selectors = CssParser::parseSelectorList(rest);
+    if (selectors.empty())
+      return false;
+
+    auto matchesAny = [&](dom::ElementPtr candidate) {
+      for (const auto &selector : selectors) {
+        if (matchSelector(candidate, selector))
+          return true;
+      }
+      return false;
+    };
+
+    if (combinator == '>') {
+      for (const auto &child : element->childNodes()) {
+        if (child->nodeType() == dom::NodeType::Element &&
+            matchesAny(std::static_pointer_cast<dom::Element>(child))) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (combinator == '+') {
+      auto next = element->nextElementSibling();
+      return next && matchesAny(next);
+    }
+    if (combinator == '~') {
+      auto sibling = element->nextElementSibling();
+      while (sibling) {
+        if (matchesAny(sibling))
+          return true;
+        sibling = sibling->nextElementSibling();
+      }
+      return false;
+    }
+
+    std::function<bool(dom::ElementPtr)> walk = [&](dom::ElementPtr node) {
+      for (const auto &child : node->childNodes()) {
+        if (child->nodeType() != dom::NodeType::Element)
+          continue;
+        auto childEl = std::static_pointer_cast<dom::Element>(child);
+        if (matchesAny(childEl) || walk(childEl))
+          return true;
+      }
+      return false;
+    };
+    return walk(element);
+  }
+
   Length parseLength(const std::string &val) {
     if (val == "auto")
       return Length::Auto();
@@ -966,6 +1392,11 @@ private:
 
     if (val.find("%") != std::string::npos)
       return Length::Percent(f);
+    // "rem" contains "em", so test it first
+    if (val.find("rem") != std::string::npos)
+      return Length{f, Length::Unit::Rem};
+    if (val.find("em") != std::string::npos)
+      return Length{f, Length::Unit::Em};
     return Length::Px(f);
   }
 
