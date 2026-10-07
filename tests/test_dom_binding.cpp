@@ -585,6 +585,180 @@ int main() {
     console.log('  firstChild.data = "' + textNode.data + '"');
   )JS");
 
+  // ─── Extended DOM (WHATWG completion) ──────────────────────
+
+  std::cout << "\n── 11. Extended DOM (WHATWG completion) ──" << std::endl;
+
+  runTest(engine, "querySelector: combinators + selector list", R"JS(
+    var ps = document.querySelectorAll('div > p');
+    console.assert(ps.length === 2, 'div > p should find 2, got: ' + ps.length);
+    var nested = document.querySelectorAll('.container .text');
+    console.assert(nested.length === 2, '.container .text should find 2');
+    var span = document.querySelector('#p1 span');
+    console.assert(span !== null && span.id === 's1', 'descendant query should find s1');
+    var list = document.querySelectorAll('h1, p');
+    console.assert(list.length === 2, 'selector list should find 2');
+    var root = document.querySelector('html');
+    console.assert(root !== null, 'document.querySelector should match documentElement');
+    console.log('  combinators + list OK');
+  )JS");
+
+  runTest(engine, "querySelector: attribute operators + pseudo", R"JS(
+    var li2 = document.querySelectorAll('li:nth-child(2)');
+    console.assert(li2.length === 1 && li2[0].id === 'li2', 'nth-child(2) should be li2');
+    var notMuted = document.querySelectorAll('p:not(.muted)');
+    console.assert(notMuted.length === 1 && notMuted[0].id === 'p1', ':not(.muted) should be p1');
+    var starts = document.querySelectorAll('[id^="li"]');
+    console.assert(starts.length === 2, '[id^="li"] should find 2');
+    console.log('  attribute operators + pseudo OK');
+  )JS");
+
+  runTest(engine, "matches / closest", R"JS(
+    var main = document.getElementById('main');
+    console.assert(main.matches('div.container') === true, 'matches should hit');
+    console.assert(main.matches('#main') === true, 'matches has no scope restriction');
+    console.assert(main.querySelectorAll('div').length === 0, 'querySelectorAll excludes self');
+    var s1 = document.getElementById('s1');
+    console.assert(s1.closest('.container') === main, 'closest should walk to main');
+    console.log('  matches/closest OK');
+  )JS");
+
+  runTest(engine, "append / prepend / replaceChildren", R"JS(
+    var host = document.createElement('div');
+    var a = document.createElement('span'); a.id = 'a';
+    var b = document.createElement('span'); b.id = 'b';
+    host.append(a, b);
+    var c = document.createElement('span'); c.id = 'c';
+    host.prepend(c);
+    console.assert(host.firstElementChild.id === 'c', 'prepend should put c first');
+    var frag = document.createDocumentFragment();
+    var d = document.createElement('span'); d.id = 'd';
+    var e = document.createElement('span'); e.id = 'e';
+    frag.appendChild(d); frag.appendChild(e);
+    host.replaceChildren(frag);
+    console.assert(host.childElementCount === 2, 'replaceChildren should leave 2');
+    console.assert(host.firstElementChild.id === 'd', 'fragment children should move over');
+    console.log('  append/prepend/replaceChildren OK');
+  )JS");
+
+  runTest(engine, "before / after / replaceWith / remove", R"JS(
+    var parent = document.createElement('div');
+    var a = document.createElement('span'); a.id = 'a';
+    var b = document.createElement('span'); b.id = 'b';
+    parent.appendChild(a); parent.appendChild(b);
+    var c = document.createElement('span'); c.id = 'c';
+    a.after(c);
+    console.assert(parent.children[1].id === 'c', 'after should insert at index 1');
+    var x = document.createElement('span'); x.id = 'x';
+    b.before(x);
+    console.assert(parent.children.length === 3 && parent.children[2].id === 'b', 'before should insert before b');
+    x.replaceWith('text!');
+    console.assert(parent.childNodes[2].nodeType === 3, 'replaceWith string becomes Text node');
+    a.remove();
+    console.assert(parent.children.length === 2, 'remove should detach a');
+    console.log('  before/after/replaceWith/remove OK');
+  )JS");
+
+  runTest(engine, "attribute API: names / hasAttributes / toggleAttribute", R"JS(
+    var el = document.createElement('div');
+    console.assert(el.hasAttributes() === false, 'new element has no attributes');
+    el.setAttribute('alpha', '1');
+    var names = el.getAttributeNames();
+    console.assert(names.length === 1 && names[0] === 'alpha', 'getAttributeNames should list alpha');
+    console.assert(el.toggleAttribute('hidden', true) === true, 'force toggle should return true');
+    console.assert(el.hasAttribute('hidden'), 'hidden should exist after force');
+    console.assert(el.toggleAttribute('hidden', false) === false, 'unforce toggle should return false');
+    console.assert(!el.hasAttribute('hidden'), 'hidden should be gone');
+    console.log('  attribute API OK');
+  )JS");
+
+  runTest(engine, "insertAdjacentHTML", R"JS(
+    var parent = document.createElement('div');
+    var mid = document.createElement('span'); mid.id = 'mid';
+    parent.appendChild(mid);
+    mid.insertAdjacentHTML('beforebegin', '<b id="bb"></b>');
+    mid.insertAdjacentHTML('afterbegin', '<i id="ab"></i>');
+    mid.insertAdjacentHTML('beforeend', '<u id="be"></u>');
+    mid.insertAdjacentHTML('afterend', '<em id="ae"></em>');
+    console.assert(parent.children.length === 3, 'parent should gain 3 siblings');
+    console.assert(parent.firstElementChild.id === 'bb', 'beforebegin should be first');
+    console.assert(parent.lastElementChild.id === 'ae', 'afterend should be last');
+    console.assert(mid.firstElementChild.id === 'ab', 'afterbegin should be first child');
+    console.log('  insertAdjacentHTML OK');
+  )JS");
+
+  runTest(engine, "outerHTML getter/setter", R"JS(
+    var parent = document.createElement('div');
+    var a = document.createElement('span'); a.id = 'a';
+    var b = document.createElement('span'); b.id = 'b';
+    parent.appendChild(a); parent.appendChild(b);
+    a.outerHTML = '<em id="x">new</em>';
+    console.assert(parent.children.length === 2, 'outerHTML set should keep 2 children');
+    console.assert(parent.firstElementChild.id === 'x', 'outerHTML should replace a with em#x');
+    console.log('  outerHTML OK');
+  )JS");
+
+  runTest(engine, "dataset", R"JS(
+    var el = document.createElement('div');
+    el.dataset.set('userId', '42');
+    el.dataset.set('layoutMode', 'grid');
+    console.assert(el.getAttribute('data-user-id') === '42', 'camelCase should map to data-user-id');
+    console.assert(el.dataset.get('userId') === '42', 'dataset.get should round-trip');
+    console.assert(el.dataset.has('layoutMode') === true, 'dataset.has should find layoutMode');
+    console.assert(el.dataset.keys().length === 2, 'dataset.keys should list 2');
+    el.dataset.delete('userId');
+    console.assert(!el.hasAttribute('data-user-id'), 'delete should remove the attribute');
+    console.log('  dataset OK');
+  )JS");
+
+  runTest(engine, "Text: splitText + CharacterData", R"JS(
+    var p = document.createElement('p');
+    var t = document.createTextNode('abcdef');
+    p.appendChild(t);
+    var rest = t.splitText(3);
+    console.assert(t.data === 'abc' && rest.data === 'def', 'splitText should split data');
+    console.assert(t.nextSibling === rest, 'rest should follow t');
+    t.appendData('!');
+    console.assert(t.data === 'abc!', 'appendData should extend');
+    console.assert(t.substringData(1, 2) === 'bc', 'substringData should slice');
+    console.log('  splitText + CharacterData OK');
+  )JS");
+
+  runTest(engine, "document: createProcessingInstruction / importNode / adoptNode / getElementsByName", R"JS(
+    var pi = document.createProcessingInstruction('xml-stylesheet', 'href="a.css"');
+    console.assert(pi.nodeType === 7, 'PI nodeType should be 7');
+    console.assert(pi.target === 'xml-stylesheet', 'PI target should match');
+
+    var li1 = document.getElementById('li1');
+    var clone = document.importNode(li1, true);
+    console.assert(clone !== null && clone.parentNode === null, 'importNode should return an unattached clone');
+
+    var li2 = document.getElementById('li2');
+    document.adoptNode(li2);
+    console.assert(document.getElementById('li2') === null, 'adoptNode should detach li2');
+
+    console.assert(document.getElementsByName('nope').length === 0, 'getElementsByName should be empty');
+    console.log('  document extended methods OK');
+  )JS");
+
+  runTest(engine, "isConnected", R"JS(
+    var el = document.createElement('div');
+    console.assert(el.isConnected === false, 'detached element is not connected');
+    document.body.appendChild(el);
+    console.assert(el.isConnected === true, 'attached element is connected');
+    console.log('  isConnected OK');
+  )JS");
+
+  runTest(engine, "addEventListener with capture option", R"JS(
+    var el = document.createElement('div');
+    var fired = false;
+    el.addEventListener('ping', function() { fired = true; }, true);
+    el.dispatchEvent('ping');
+    console.assert(fired === true, 'capture listener should fire at target');
+    el.removeEventListener('ping', function() {}, true);
+    console.log('  capture option OK');
+  )JS");
+
   // ─── Summary ───────────────────────────────────────────────
 
   std::cout << "\n══════════════════════════════════════════════" << std::endl;
