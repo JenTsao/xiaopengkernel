@@ -138,6 +138,24 @@ TEST(UnsetKeyword) {
   EXPECT_TRUE(pStyle.marginTop.value == 0.0f);
 }
 
+TEST(InheritKeyword_LonghandBox) {
+  Tree t;
+  auto sheet = parseSheet(
+      "body { margin-top: 5px; padding-left: 7px; border-top-width: 2px; "
+      "overflow-x: hidden; } "
+      "p { margin-top: inherit; padding-left: inherit; "
+      "border-top-width: inherit; overflow-x: inherit; }");
+  StyleResolver resolver;
+  auto bodyStyle = resolver.resolveStyle(t.body, sheet, nullptr);
+  auto pStyle = resolver.resolveStyle(t.p, sheet, &bodyStyle);
+
+  // longhands must be copyable too, not just the shorthands
+  EXPECT_TRUE(pStyle.marginTop.value == 5.0f);
+  EXPECT_TRUE(pStyle.paddingLeft.value == 7.0f);
+  EXPECT_TRUE(pStyle.borderTopWidth.value == 2.0f);
+  EXPECT_TRUE(pStyle.overflowX == Overflow::Hidden);
+}
+
 // ── Shorthand expansion ──────────────────────────────────────
 
 TEST(MarginShorthand_MultiValue) {
@@ -362,6 +380,81 @@ TEST(WherePseudo_Matches) {
   auto pbStyle = resolver.resolveStyle(t.pb, sheet, nullptr);
   EXPECT_TRUE(paStyle.color.r == 255);
   EXPECT_TRUE(pbStyle.color.r == 0);
+}
+
+TEST(FunctionalPseudoSpecificity) {
+  // :where() is always zero, regardless of its arguments (CSS Selectors 4)
+  auto where = CssParser::parseSelectorList(":where(#a, .b)");
+  EXPECT_TRUE(where.size() == 1);
+  Specificity ws = where[0].specificity();
+  EXPECT_TRUE(ws.a == 0 && ws.b == 0 && ws.c == 0);
+
+  // :is() weighs its most specific argument
+  auto is = CssParser::parseSelectorList(":is(#a, .b)");
+  EXPECT_TRUE(is.size() == 1);
+  Specificity isSpec = is[0].specificity();
+  EXPECT_TRUE(isSpec.a == 1 && isSpec.b == 0 && isSpec.c == 0);
+
+  // argument weight, not a blanket (0,1,0)
+  auto isLight = CssParser::parseSelectorList(":is(em, span)");
+  Specificity isLightSpec = isLight[0].specificity();
+  EXPECT_TRUE(isLightSpec.a == 0 && isLightSpec.b == 0 && isLightSpec.c == 1);
+
+  // :has() weighs its relative argument
+  auto has = CssParser::parseSelectorList("div:has(> em)");
+  EXPECT_TRUE(has.size() == 1);
+  Specificity hasSpec = has[0].specificity();
+  EXPECT_TRUE(hasSpec.a == 0 && hasSpec.b == 0 && hasSpec.c == 2);
+
+  // plain pseudo-classes stay (0,1,0)
+  auto hover = CssParser::parseSelectorList("a:hover");
+  Specificity hoverSpec = hover[0].specificity();
+  EXPECT_TRUE(hoverSpec.a == 0 && hoverSpec.b == 1 && hoverSpec.c == 1);
+}
+
+TEST(WhereSpecificity_ZeroWeight) {
+  PseudoTree t;
+  // p:where(.a) weighs (0,0,1) — ties with p and loses to source order.
+  // A (0,1,1) weight would wrongly let the red rule win.
+  auto sheet = parseSheet("p:where(.a) { color: red; } p { color: green; }");
+  StyleResolver resolver;
+  auto paStyle = resolver.resolveStyle(t.pa, sheet, nullptr);
+  EXPECT_TRUE(paStyle.color.g == 255);
+  EXPECT_TRUE(paStyle.color.r == 0);
+}
+
+TEST(IsSpecificity_MostSpecificArgument) {
+  auto doc = std::make_shared<Document>();
+  auto p = doc->createElement("p");
+  p->setId("target");
+  p->setClassName("a");
+  doc->appendChild(p);
+
+  // :is() weighs its most specific argument even when unmatched:
+  // p:is(.a, #nope) = (1,0,1) beats #target (1,0,0). A plain (0,1,1)
+  // pseudo-class weight would lose to the ID rule.
+  auto sheet = parseSheet("p:is(.a, #nope) { color: red; } #target { color: green; }");
+  StyleResolver resolver;
+  auto style = resolver.resolveStyle(p, sheet, nullptr);
+  EXPECT_TRUE(style.color.r == 255);
+  EXPECT_TRUE(style.color.g == 0);
+}
+
+TEST(HasSpecificity_ArgumentWeight) {
+  auto doc = std::make_shared<Document>();
+  auto div = doc->createElement("div");
+  div->setClassName("x");
+  auto em = doc->createElement("em");
+  div->appendChild(em);
+  doc->appendChild(div);
+
+  // :has() weighs its argument: div:has(em) = (0,0,2) loses to .x (0,1,0).
+  // A plain (0,1,1) weight would win by source order.
+  auto sheet = parseSheet(".x { color: green; } div:has(em) { color: red; }");
+  StyleResolver resolver;
+  auto style = resolver.resolveStyle(div, sheet, nullptr);
+  EXPECT_TRUE(style.color.g == 255);
+  EXPECT_TRUE(style.color.r == 0);
 }
 
 TEST(HasPseudo_Relations) {

@@ -68,6 +68,41 @@ public:
     return result;
   }
 
+  // Specificity contribution of a functional pseudo-class, per CSS Selectors
+  // Level 4: :where(...) is always zero; :is(...)/:has(...) weigh their most
+  // specific argument. Returns nullopt when there is no special rule (unknown
+  // function) or the argument list cannot be parsed — callers then keep the
+  // plain (0,1,0) pseudo-class weight.
+  static std::optional<Specificity>
+  functionalPseudoSpecificity(const std::string &funcName,
+                              const std::string &args) {
+    if (funcName == "where")
+      return Specificity{}; // always zero, even for unparseable arguments
+    if (funcName != "is" && funcName != "has")
+      return std::nullopt;
+
+    std::string list = args;
+    if (funcName == "has") {
+      // Relative selector: strip a leading combinator (> + ~); the match
+      // engine resolves it against :scope the same way (matchHasRelative).
+      size_t i = list.find_first_not_of(" \t\r\n\f");
+      if (i != std::string::npos &&
+          (list[i] == '>' || list[i] == '+' || list[i] == '~'))
+        list = list.substr(i + 1);
+    }
+
+    auto selectors = parseSelectorList(list);
+    if (selectors.empty())
+      return std::nullopt;
+    Specificity max{};
+    for (const auto &sel : selectors) {
+      Specificity sp = sel.specificity();
+      if (max < sp)
+        max = sp;
+    }
+    return max;
+  }
+
 private:
   CssTokenizer tokenizer_;
   std::vector<Token> tokens_;
@@ -340,6 +375,9 @@ private:
               consume(); // )
             }
             part.value = funcName + "(" + args + ")";
+            // Precompute the specificity contribution (:is/:where/:has have
+            // special rules; other functions keep the default (0,1,0)).
+            part.functionSpecificity = functionalPseudoSpecificity(funcName, args);
             gotPart = true;
           }
         } else if (t.is(TokenType::OpenSquare)) {

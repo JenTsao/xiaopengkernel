@@ -103,6 +103,30 @@ enum class Combinator {
   SubsequentSibling // '~'
 };
 
+// Specificity of a selector (a=IDs, b=classes/attributes/pseudo-classes,
+// c=tags/pseudo-elements). At namespace scope so SimpleSelector can carry a
+// precomputed contribution for functional pseudo-classes.
+struct Specificity {
+  uint32_t a = 0; // IDs
+  uint32_t b = 0; // Classes, Attributes, Pseudo-classes
+  uint32_t c = 0; // Tags, Pseudo-elements
+
+  bool operator<(const Specificity &other) const {
+    if (a != other.a)
+      return a < other.a;
+    if (b != other.b)
+      return b < other.b;
+    return c < other.c;
+  }
+  bool operator>(const Specificity &other) const { return other < *this; }
+  bool operator==(const Specificity &other) const {
+    return a == other.a && b == other.b && c == other.c;
+  }
+  bool operator!=(const Specificity &other) const {
+    return !(*this == other);
+  }
+};
+
 struct SimpleSelector {
   SelectorType type;
   std::string value; // tag name, class name, id, etc.
@@ -110,6 +134,12 @@ struct SimpleSelector {
   std::string attributeName;
   std::string attributeValue;
   std::string attributeOperator; // =, ~=, |=, etc.
+  // Functional pseudo-classes (:is()/:where()/:has()) do not weigh as a
+  // plain (0,1,0): :where() contributes zero and :is()/:has() contribute
+  // their most specific argument (CSS Selectors Level 4). The parser
+  // precomputes that contribution here; empty means "fall back to (0,1,0)"
+  // (hand-built selectors or unparseable argument lists).
+  std::optional<Specificity> functionSpecificity;
 
   bool match(const std::string &specificValue) const {
     // Basic match logic stub
@@ -122,27 +152,8 @@ struct Selector {
   std::vector<Combinator>
       combinators; // combinators[i] is between parts[i] and parts[i+1]
 
-  // Specificity structure to prevent overflow
-  struct Specificity {
-    uint32_t a = 0; // IDs
-    uint32_t b = 0; // Classes, Attributes, Pseudo-classes
-    uint32_t c = 0; // Tags, Pseudo-elements
-
-    bool operator<(const Specificity &other) const {
-      if (a != other.a)
-        return a < other.a;
-      if (b != other.b)
-        return b < other.b;
-      return c < other.c;
-    }
-    bool operator>(const Specificity &other) const { return other < *this; }
-    bool operator==(const Specificity &other) const {
-      return a == other.a && b == other.b && c == other.c;
-    }
-    bool operator!=(const Specificity &other) const {
-      return !(*this == other);
-    }
-  };
+  // Specificity type kept as a member alias for backwards compatibility
+  using Specificity = ::xiaopeng::css::Specificity;
 
   // Calculate specificity
   Specificity specificity() const {
@@ -155,8 +166,19 @@ struct Selector {
         break;
       case SelectorType::Class:
       case SelectorType::Attribute:
-      case SelectorType::PseudoClass:
         s.b++;
+        break;
+      case SelectorType::PseudoClass:
+        // Functional pseudo-classes carry their precomputed contribution:
+        // :where(...) weighs zero; :is(...)/:has(...) weigh their most
+        // specific argument. Everything else stays (0,1,0).
+        if (part.functionSpecificity) {
+          s.a += part.functionSpecificity->a;
+          s.b += part.functionSpecificity->b;
+          s.c += part.functionSpecificity->c;
+        } else {
+          s.b++;
+        }
         break;
       case SelectorType::Tag:
       case SelectorType::PseudoElement:

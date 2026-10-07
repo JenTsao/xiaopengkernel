@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -1122,23 +1123,59 @@ private:
       dst.marginRight = src.marginRight;
       dst.marginBottom = src.marginBottom;
       dst.marginLeft = src.marginLeft;
+    } else if (name == "margin-top") {
+      dst.marginTop = src.marginTop;
+    } else if (name == "margin-right") {
+      dst.marginRight = src.marginRight;
+    } else if (name == "margin-bottom") {
+      dst.marginBottom = src.marginBottom;
+    } else if (name == "margin-left") {
+      dst.marginLeft = src.marginLeft;
     } else if (name == "padding") {
       dst.paddingTop = src.paddingTop;
       dst.paddingRight = src.paddingRight;
       dst.paddingBottom = src.paddingBottom;
+      dst.paddingLeft = src.paddingLeft;
+    } else if (name == "padding-top") {
+      dst.paddingTop = src.paddingTop;
+    } else if (name == "padding-right") {
+      dst.paddingRight = src.paddingRight;
+    } else if (name == "padding-bottom") {
+      dst.paddingBottom = src.paddingBottom;
+    } else if (name == "padding-left") {
       dst.paddingLeft = src.paddingLeft;
     } else if (name == "border-width") {
       dst.borderTopWidth = src.borderTopWidth;
       dst.borderRightWidth = src.borderRightWidth;
       dst.borderBottomWidth = src.borderBottomWidth;
       dst.borderLeftWidth = src.borderLeftWidth;
+    } else if (name == "border-top-width") {
+      dst.borderTopWidth = src.borderTopWidth;
+    } else if (name == "border-right-width") {
+      dst.borderRightWidth = src.borderRightWidth;
+    } else if (name == "border-bottom-width") {
+      dst.borderBottomWidth = src.borderBottomWidth;
+    } else if (name == "border-left-width") {
+      dst.borderLeftWidth = src.borderLeftWidth;
     } else if (name == "border-color") {
       dst.borderTopColor = src.borderTopColor;
       dst.borderRightColor = src.borderRightColor;
       dst.borderBottomColor = src.borderBottomColor;
       dst.borderLeftColor = src.borderLeftColor;
+    } else if (name == "border-top-color") {
+      dst.borderTopColor = src.borderTopColor;
+    } else if (name == "border-right-color") {
+      dst.borderRightColor = src.borderRightColor;
+    } else if (name == "border-bottom-color") {
+      dst.borderBottomColor = src.borderBottomColor;
+    } else if (name == "border-left-color") {
+      dst.borderLeftColor = src.borderLeftColor;
     } else if (name == "overflow") {
       dst.overflowX = src.overflowX;
+      dst.overflowY = src.overflowY;
+    } else if (name == "overflow-x") {
+      dst.overflowX = src.overflowX;
+    } else if (name == "overflow-y") {
       dst.overflowY = src.overflowY;
     } else if (name.size() >= 2 && name[0] == '-' && name[1] == '-') {
       if (const auto *v = src.getCustomProperty(name)) {
