@@ -205,6 +205,8 @@ jobs:
 
     - name: Generate Coverage Report
       run: |
+        mkdir -p coverage
+        set -o pipefail
         gcovr --root . --filter 'include/' --filter 'src/' --xml coverage.xml --html-details coverage/index.html --print-summary | tee coverage-summary.txt
 
     - name: Append Coverage Summary
