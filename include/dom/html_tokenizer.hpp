@@ -525,10 +525,11 @@ inline void HtmlTokenizer::handleDataState() {
         returnState_ = TokenizerState::Data;
         std::string ref = consumeCharacterReference();
         if (!ref.empty()) {
+            // Flush buffered text before the entity, then emit the entity
+            // itself (dropping ref here would silently lose "&…;" after text)
             if (!characterTokenBuffer_.empty()) {
                 emitToken(Token::makeCharacter(characterTokenBuffer_));
                 characterTokenBuffer_.clear();
-                return;
             }
             emitToken(Token::makeCharacter(ref));
             return;
