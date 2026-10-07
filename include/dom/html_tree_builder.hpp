@@ -248,7 +248,7 @@ HtmlTreeBuilder::build(const loader::ByteBuffer &html) {
   return build(tokenizer);
 }
 
-inline HtmlTreeBuilder::InsertionMode
+inline InsertionMode
 HtmlTreeBuilder::insertionModeForContext(const std::string &tagName) {
   if (tagName == "select")
     return InsertionMode::InSelect;
