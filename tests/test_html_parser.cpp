@@ -1,5 +1,6 @@
 #include "test_framework.hpp"
 #include "loader/loader_all.hpp"
+#include "dom/dom_enhancements.hpp"
 
 using namespace xiaopeng::loader;
 using namespace xiaopeng::dom;
@@ -487,15 +488,148 @@ TEST(HtmlParser_VoidElements) {
 
 TEST(HtmlParser_EntityDecoding) {
     std::string html = "<div>&amp;&lt;&gt;&quot;&apos;</div>";
-    
+
     auto result = HtmlParser::parseHtml(html);
     EXPECT_TRUE(result.ok());
-    
+
     auto divs = result.document->getElementsByTagName("div");
     EXPECT_EQ(divs.size(), 1);
-    
+
     std::string content = divs[0]->textContent();
     EXPECT_TRUE(content.find("&") != std::string::npos);
     EXPECT_TRUE(content.find("<") != std::string::npos);
     EXPECT_TRUE(content.find(">") != std::string::npos);
+}
+
+// ── Extended named entities ──────────────────────────────────
+
+TEST(HtmlParser_NamedEntities_Extended) {
+    std::string html = "<p>&mdash;&eacute;&frac12;&Sigma;&larr;&euro;&hellip;</p>";
+
+    auto result = HtmlParser::parseHtml(html);
+    EXPECT_TRUE(result.ok());
+
+    auto ps = result.document->getElementsByTagName("p");
+    ASSERT_EQ(ps.size(), (size_t)1);
+    std::string content = ps[0]->textContent();
+
+    EXPECT_TRUE(content.find("\u2014") != std::string::npos); // mdash
+    EXPECT_TRUE(content.find("\u00E9") != std::string::npos); // eacute
+    EXPECT_TRUE(content.find("\u00BD") != std::string::npos); // frac12
+    EXPECT_TRUE(content.find("\u03A3") != std::string::npos); // Sigma
+    EXPECT_TRUE(content.find("\u2190") != std::string::npos); // larr
+    EXPECT_TRUE(content.find("\u20AC") != std::string::npos); // euro
+    EXPECT_TRUE(content.find("\u2026") != std::string::npos); // hellip
+}
+
+TEST(HtmlParser_EntityLongestMatch) {
+    // "&notin" must win over "&not" when followed by "in"
+    {
+        auto result = HtmlParser::parseHtml("<p>x&notin;y</p>");
+        auto ps = result.document->getElementsByTagName("p");
+        ASSERT_EQ(ps.size(), (size_t)1);
+        std::string content = ps[0]->textContent();
+        EXPECT_TRUE(content.find("\u2209") != std::string::npos); // ∉
+        EXPECT_TRUE(content.find("x") != std::string::npos);
+        EXPECT_TRUE(content.find("y") != std::string::npos);
+    }
+    {
+        // "&amp" matched without semicolon leaves the rest as text
+        auto result = HtmlParser::parseHtml("<p>u&ampx;</p>");
+        auto ps = result.document->getElementsByTagName("p");
+        ASSERT_EQ(ps.size(), (size_t)1);
+        EXPECT_STREQ(ps[0]->textContent().c_str(), "u&x;");
+    }
+    {
+        // "b" right after "&amp" is not part of the entity
+        auto result = HtmlParser::parseHtml("<p>a&ampb</p>");
+        auto ps = result.document->getElementsByTagName("p");
+        ASSERT_EQ(ps.size(), (size_t)1);
+        EXPECT_STREQ(ps[0]->textContent().c_str(), "a&b");
+    }
+}
+
+TEST(HtmlParser_EntityWithoutSemicolon_Legacy) {
+    auto result = HtmlParser::parseHtml("<p>&copy 2024</p>");
+    auto ps = result.document->getElementsByTagName("p");
+    ASSERT_EQ(ps.size(), (size_t)1);
+    std::string content = ps[0]->textContent();
+    EXPECT_TRUE(content.find("\u00A9") != std::string::npos); // ©
+    EXPECT_TRUE(content.find("2024") != std::string::npos);
+}
+
+TEST(HtmlParser_NumericC1Remap) {
+    // &#151; maps to em dash via the windows-1252 table, same as &#8212;
+    {
+        auto result = HtmlParser::parseHtml("<p>&#8212;</p>");
+        auto ps = result.document->getElementsByTagName("p");
+        ASSERT_EQ(ps.size(), (size_t)1);
+        EXPECT_TRUE(ps[0]->textContent() == std::string("\xE2\x80\x94"));
+    }
+    {
+        auto result = HtmlParser::parseHtml("<p>&#151;</p>");
+        auto ps = result.document->getElementsByTagName("p");
+        ASSERT_EQ(ps.size(), (size_t)1);
+        EXPECT_TRUE(ps[0]->textContent() == std::string("\xE2\x80\x94"));
+    }
+    {
+        auto result = HtmlParser::parseHtml("<p>&#146;</p>");
+        auto ps = result.document->getElementsByTagName("p");
+        ASSERT_EQ(ps.size(), (size_t)1);
+        EXPECT_TRUE(ps[0]->textContent() == std::string("\xE2\x80\x99"));
+    }
+}
+
+// ── Fragment parsing with context element ────────────────────
+
+TEST(FragmentParsing_TableContext) {
+    auto doc = std::make_shared<Document>();
+    auto tr = doc->createElement("tr");
+
+    // In body context a <td> start tag is an error and gets dropped; in a
+    // tr context it must parse as a table cell.
+    auto nodes = HtmlParser::parseFragment("<td>a</td><td>b</td>", tr);
+    ASSERT_EQ(nodes.size(), (size_t)2);
+    EXPECT_TRUE(nodes[0]->nodeType() == NodeType::Element);
+    auto td1 = std::static_pointer_cast<Element>(nodes[0]);
+    auto td2 = std::static_pointer_cast<Element>(nodes[1]);
+    EXPECT_STREQ(td1->localName().c_str(), "td");
+    EXPECT_STREQ(td2->localName().c_str(), "td");
+    EXPECT_STREQ(td1->textContent().c_str(), "a");
+    EXPECT_STREQ(td2->textContent().c_str(), "b");
+}
+
+TEST(FragmentParsing_TextInCellContext) {
+    auto doc = std::make_shared<Document>();
+    auto td = doc->createElement("td");
+
+    auto nodes = HtmlParser::parseFragment("hello <b>world</b>", td);
+    ASSERT_EQ(nodes.size(), (size_t)2);
+    EXPECT_TRUE(nodes[0]->nodeType() == NodeType::Text);
+    EXPECT_TRUE(nodes[1]->nodeType() == NodeType::Element);
+    EXPECT_STREQ(std::static_pointer_cast<Element>(nodes[1])->localName().c_str(),
+                 "b");
+}
+
+TEST(FragmentParsing_DefaultBodyContextUnchanged) {
+    auto nodes = HtmlParser::parseFragment("<div>x</div>");
+    ASSERT_EQ(nodes.size(), (size_t)1);
+    EXPECT_TRUE(nodes[0]->nodeType() == NodeType::Element);
+    EXPECT_STREQ(std::static_pointer_cast<Element>(nodes[0])->localName().c_str(),
+                 "div");
+}
+
+TEST(FragmentParsing_InsertAdjacentTd) {
+    auto doc = std::make_shared<Document>();
+    auto table = doc->createElement("table");
+    auto tr = doc->createElement("tr");
+    auto td = doc->createElement("td");
+    td->appendChild(doc->createTextNode("first"));
+    tr->appendChild(td);
+    table->appendChild(tr);
+    doc->appendChild(table);
+
+    td->insertAdjacentHTML("afterend", "<td>next</td>");
+    ASSERT_EQ(tr->childElementCount(), (size_t)2);
+    EXPECT_STREQ(tr->lastElementChild()->textContent().c_str(), "next");
 }

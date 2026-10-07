@@ -176,7 +176,7 @@ int main() {
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| **HTML 解析器** | ✅ 完整 | WHATWG 规范状态机，65 个解析状态，字符引用解码 |
+| **HTML 解析器** | ✅ 完整 | WHATWG 规范状态机，65 个解析状态，250+ 命名字符引用，C1 数字引用映射，上下文片段解析 |
 | **CSS 解析器** | ✅ 完善 | 选择器解析、属性选择器、伪类 / 伪元素、样式继承、简写展开、CSS 变量、em/rem 单位 |
 | **DOM 树** | ✅ 完整 | Element / Document / TextNode / Comment 及完整 API |
 | **布局引擎** | ✅ 进阶 | Block / Inline / Flexbox / Grid，BFC / IFC 混合排版 |
@@ -191,6 +191,8 @@ int main() {
 
 **1. HTML / CSS 解析**
 - 完整 WHATWG 规范 HTML 词法分析器（65 个状态）+ 树构建器（23+ 插入模式）
+- 字符引用：250+ 命名实体（希腊字母、箭头、数学符号、引号破折号等）、最长匹配回溯、数字引用的 C1 windows-1252 映射
+- 上下文片段解析：`parseFragment(html, context)` —— 片段按容器（td/tr/select 等）的插入模式解析，`insertAdjacentHTML` 与 `innerHTML` 均已接入
 - CSS 选择器：Tag、Class、Id、Attribute、Pseudo-class、Pseudo-element
 - 属性选择器运算符：`=`、`~=`、`|=`、`^=`、`$=`、`*=`
 - 伪类：`:first-child`、`:last-child`、`:nth-child`、`:first-of-type`、`:lang()`、`:not()`、`:is()`、`:where()`、`:has()` 等
