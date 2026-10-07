@@ -441,6 +441,7 @@ list(FILTER LOADER_TEST_SOURCES EXCLUDE REGEX "test_page_lifecycle\\.cpp$")
 list(FILTER LOADER_TEST_SOURCES EXCLUDE REGEX "test_ifc\\.cpp$")
 list(FILTER LOADER_TEST_SOURCES EXCLUDE REGEX "test_phase2_selectors_stacking\\.cpp$")
 list(FILTER LOADER_TEST_SOURCES EXCLUDE REGEX "test_dom_complete\\.cpp$")
+list(FILTER LOADER_TEST_SOURCES EXCLUDE REGEX "test_css_complete\\.cpp$")
 
 add_xpk_test(loader_tests ${LOADER_TEST_SOURCES})
 add_xpk_test_sdl(loader_tests)
@@ -473,6 +474,7 @@ add_xpk_test_sdl(test_dom_binding)
 add_xpk_test_freetype(test_dom_binding)
 add_xpk_test(test_phase2_selectors_stacking tests/test_phase2_selectors_stacking.cpp)
 add_xpk_test(test_dom_complete tests/test_dom_complete.cpp)
+add_xpk_test(test_css_complete tests/test_css_complete.cpp)
 
 add_custom_target(run
     COMMAND ${PROJECT_NAME}
