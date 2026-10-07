@@ -12,8 +12,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── 主线：Linux + Windows，Release，FreeType 开启 ──────────
   build-and-test:
-    name: Build on ${{ matrix.os }}
+    name: ${{ matrix.os }} · Release · FreeType
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -82,8 +83,18 @@ jobs:
     # --- 运行测试 ---
     - name: Run Tests (ctest)
       working-directory: build
-      # 失败时显示详细日志：使用 --output-on-failure 和 --verbose
-      run: ctest -C Release --output-on-failure --verbose
+      # 失败时显示详细日志；同时输出 JUnit 报告供上传
+      run: ctest -C Release --output-on-failure --output-junit test-results.xml
+
+    # --- 上传测试结果（JUnit） ---
+    - name: Upload Test Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ runner.os }}
+        path: build/test-results.xml
+        if-no-files-found: ignore
+        retention-days: 5
 
     # --- 上传构建产物 ---
     - name: Upload Build Artifacts
@@ -98,4 +109,159 @@ jobs:
           !build/**/*.o
           !build/**/*.obj
           !build/**/*.a
+        retention-days: 5
+
+  # ── Linux 配置矩阵：Debug 构建 + FreeType 关闭路径 ─────────
+  # 覆盖默认配置（ENABLE_FREETYPE 默认 OFF）与 Debug 断言
+  linux-variants:
+    name: Linux · ${{ matrix.build_type }} · FreeType ${{ matrix.freetype }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build_type: Debug
+            freetype: ON
+          - build_type: Debug
+            freetype: OFF
+          - build_type: Release
+            freetype: OFF
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake gcc g++ build-essential libcurl4-openssl-dev libsdl2-dev libgl1-mesa-dev pkg-config libfreetype6-dev libharfbuzz-dev
+
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DENABLE_FREETYPE=${{ matrix.freetype }}
+
+    - name: Build
+      run: cmake --build build -j 4
+
+    - name: Run Tests (ctest)
+      working-directory: build
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure
+
+  # ── 编译器矩阵：Clang ──────────────────────────────────────
+  linux-clang:
+    name: Linux · Clang Release · FreeType
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake clang build-essential libcurl4-openssl-dev libsdl2-dev libgl1-mesa-dev pkg-config libfreetype6-dev libharfbuzz-dev
+
+    - name: Configure CMake (Clang)
+      env:
+        CC: clang
+        CXX: clang++
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_FREETYPE=ON
+
+    - name: Build
+      run: cmake --build build -j 4
+
+    - name: Run Tests (ctest)
+      working-directory: build
+      run: ctest -C Release --output-on-failure
+
+  # ── 覆盖率报告（GCC + gcovr） ──────────────────────────────
+  coverage:
+    name: Coverage (GCC)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake gcc g++ build-essential libcurl4-openssl-dev libsdl2-dev libgl1-mesa-dev pkg-config libfreetype6-dev libharfbuzz-dev gcovr
+
+    - name: Configure CMake (coverage instrumentation)
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_FREETYPE=ON -DCMAKE_C_FLAGS=--coverage -DCMAKE_CXX_FLAGS=--coverage -DCMAKE_EXE_LINKER_FLAGS=--coverage
+
+    - name: Build
+      run: cmake --build build -j 4
+
+    - name: Run Tests (ctest)
+      working-directory: build
+      run: ctest -C Debug --output-on-failure
+
+    - name: Generate Coverage Report
+      run: |
+        gcovr --root . --filter 'include/' --filter 'src/' --xml coverage.xml --html-details coverage/index.html --print-summary | tee coverage-summary.txt
+
+    - name: Append Coverage Summary
+      run: |
+        echo "### 代码覆盖率（include/ + src/）" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload Coverage Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          coverage.xml
+          coverage/
+        retention-days: 5
+
+  # ── 静态分析（cppcheck，非阻塞：仅报告不卡门禁） ────────────
+  static-analysis:
+    name: Static Analysis (cppcheck)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install cppcheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cppcheck
+
+    - name: Run cppcheck
+      run: |
+        cppcheck -j 4 \
+          --enable=warning,performance,portability \
+          --inline-suppr \
+          --suppress=missingIncludeSystem \
+          --suppress=unusedFunction \
+          --std=c++20 \
+          -I include \
+          include src 2>&1 | tee cppcheck-report.txt
+
+    - name: Append Static Analysis Summary
+      if: always()
+      run: |
+        echo "### cppcheck 静态分析（非阻塞）" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        tail -50 cppcheck-report.txt >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload Static Analysis Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cppcheck-report
+        path: cppcheck-report.txt
         retention-days: 5

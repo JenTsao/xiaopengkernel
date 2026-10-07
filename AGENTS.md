@@ -57,7 +57,13 @@ cd build && ctest --output-on-failure
 
 ## CI
 
-- 工作流：`.github/workflows/ci.yml` — Linux + Windows 双平台矩阵，Release 构建 + `ctest`，push 到 `main`/`master` 与 PR 触发。
+- 工作流：`.github/workflows/ci.yml` — push 到 `main`/`master` 与 PR 触发，包含五个并行任务：
+  1. **build-and-test**（回归门禁）— Linux + Windows 双平台矩阵，Release + FreeType，`ctest` + JUnit 结果上传
+  2. **linux-variants** — Linux 配置矩阵：Debug×{FreeType ON/OFF} + Release×FreeType OFF，覆盖默认配置路径与 Debug 断言
+  3. **linux-clang** — Clang 编译器线（Release + FreeType）
+  4. **coverage** — GCC `--coverage` 插桩 + gcovr 报告（include/ + src/），摘要写入 Step Summary，产物上传
+  5. **static-analysis** — cppcheck 静态分析（非阻塞，`continue-on-error`，报告进 Step Summary 与产物）
+- 只有 **build-and-test** 与 **linux-variants**、**linux-clang** 是门禁任务（失败即红）；coverage 失败也会标红，static-analysis 不会。
 - CI 是事实上的回归门禁：任何行为变更必须伴随测试更新。
 
 ## 其他约定
