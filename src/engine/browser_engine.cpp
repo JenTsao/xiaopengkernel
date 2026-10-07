@@ -500,7 +500,12 @@ void BrowserEngine::handleMouseClicks() {
           if (ctx) {
             JSValue eventObj =
                 script::EventBinding::createEventObject(ctx, "click");
-            script::EventBinding::dispatch(ctx, it->second, eventObj);
+            std::vector<uint32_t> listenerIds;
+            listenerIds.reserve(it->second.size());
+            for (const auto &entry : it->second) {
+              listenerIds.push_back(entry.id);
+            }
+            script::EventBinding::dispatch(ctx, listenerIds, eventObj);
             JS_FreeValue(ctx, eventObj);
             m_needsPaint = true;
           }

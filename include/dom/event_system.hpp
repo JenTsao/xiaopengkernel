@@ -9,13 +9,8 @@
 namespace xiaopeng {
 namespace dom {
 
-// Event phase constants (W3C standard)
-enum class EventPhase : uint8_t {
-  None = 0,
-  Capturing = 1,
-  AtTarget = 2,
-  Bubbling = 3
-};
+// EventPhase is defined in html_types.hpp (Node needs it for phase-filtered
+// listener lookup); it is visible here through that include.
 
 // Event class representing a DOM Event
 class Event {

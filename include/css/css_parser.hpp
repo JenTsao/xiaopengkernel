@@ -44,6 +44,30 @@ public:
     return sheet;
   }
 
+  // Parse a standalone selector list ("div > p, .item") as used by the DOM
+  // querySelector API. Returns an empty vector for invalid input (callers
+  // treat that as "no match" instead of throwing).
+  static std::vector<Selector> parseSelectorList(const std::string &input) {
+    CssParser parser(input);
+    std::vector<Selector> result;
+    while (true) {
+      parser.consumeWhitespace();
+      if (parser.peek().is(TokenType::EndOfFile))
+        break;
+      auto selector = parser.parseSelector();
+      if (!selector)
+        return {};
+      result.push_back(*selector);
+      parser.consumeWhitespace();
+      if (parser.peek().is(TokenType::Comma)) {
+        parser.consume();
+        continue;
+      }
+      break;
+    }
+    return result;
+  }
+
 private:
   CssTokenizer tokenizer_;
   std::vector<Token> tokens_;

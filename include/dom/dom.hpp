@@ -86,6 +86,91 @@ public:
     }
   }
 
+  // toggleAttribute with force: returns the resulting attribute presence
+  bool toggleAttribute(const std::string &name, bool force) {
+    if (force) {
+      setAttribute(name, "");
+      return true;
+    }
+    removeAttribute(name);
+    return false;
+  }
+
+  std::vector<std::string> getAttributeNames() const {
+    std::vector<std::string> names;
+    names.reserve(attributes_.size());
+    for (const auto &attr : attributes_) {
+      names.push_back(attr.name);
+    }
+    return names;
+  }
+
+  bool hasAttributes() const { return !attributes_.empty(); }
+
+  // ── dataset (data-* attributes) ─────────────────────────────
+  // "userId" <-> "data-user-id"
+  static std::string datasetToAttributeName(const std::string &key) {
+    std::string name = "data-";
+    for (char c : key) {
+      if (c >= 'A' && c <= 'Z') {
+        name += '-';
+        name += static_cast<char>(c - 'A' + 'a');
+      } else {
+        name += c;
+      }
+    }
+    return name;
+  }
+
+  static std::string datasetToKey(const std::string &attrName) {
+    std::string lower = toLower(attrName);
+    if (lower.size() <= 5 || lower.compare(0, 5, "data-") != 0)
+      return "";
+    std::string key;
+    bool dash = false;
+    for (size_t i = 5; i < lower.size(); ++i) {
+      char c = lower[i];
+      if (c == '-') {
+        dash = true;
+        continue;
+      }
+      if (dash && c >= 'a' && c <= 'z') {
+        key += static_cast<char>(c - 'a' + 'A');
+      } else {
+        key += c;
+      }
+      dash = false;
+    }
+    return key;
+  }
+
+  std::optional<std::string> getDataset(const std::string &key) const {
+    return getAttribute(datasetToAttributeName(key));
+  }
+
+  void setDataset(const std::string &key, const std::string &value) {
+    setAttribute(datasetToAttributeName(key), value);
+  }
+
+  bool hasDataset(const std::string &key) const {
+    return hasAttribute(datasetToAttributeName(key));
+  }
+
+  void deleteDataset(const std::string &key) {
+    removeAttribute(datasetToAttributeName(key));
+  }
+
+  std::vector<std::string> datasetKeys() const {
+    std::vector<std::string> keys;
+    for (const auto &attr : attributes_) {
+      auto k = datasetToKey(attr.name);
+      if (!k.empty()) {
+        keys.push_back(k);
+      }
+    }
+    return keys;
+  }
+
   std::string id() const { return getAttribute("id").value_or(""); }
 
   void setId(const std::string &id) { setAttribute("id", id); }
@@ -364,6 +449,29 @@ public:
   ElementPtr querySelector(const std::string &selector) const;
 
   bool matches(const std::string &selector) const;
+  ElementPtr closest(const std::string &selector) const;
+
+  // HTML-fragment mutation (defined in dom/dom_enhancements.hpp — they need
+  // HtmlParser, which depends on the complete dom types)
+  void setInnerHTML(const std::string &html);
+  void setOuterHTML(const std::string &html);
+  void insertAdjacentHTML(const std::string &position, const std::string &html);
+  void insertAdjacentText(const std::string &position, const std::string &text);
+  void insertAdjacentElement(const std::string &position, ElementPtr element);
+
+  bool isEqualNodeSelf(const Node &other) const override {
+    const auto &o = static_cast<const Element &>(other);
+    if (toLower(localName_) != toLower(o.localName_))
+      return false;
+    if (attributes_.size() != o.attributes_.size())
+      return false;
+    for (const auto &attr : attributes_) {
+      auto v = o.getAttribute(attr.name);
+      if (!v.has_value() || v.value() != attr.value)
+        return false;
+    }
+    return true;
+  }
 
   NodePtr cloneNode(bool deep = false) const override {
     auto cloned = std::make_shared<Element>(localName_, namespaceUri_, prefix_);
@@ -477,27 +585,76 @@ private:
     }
   }
 
-  void collectByAttribute(const std::string &attrName,
-                          const std::string &attrValue,
-                          std::vector<ElementPtr> &result) const {
-    for (const auto &child : childNodes_) {
-      if (child->nodeType() == NodeType::Element) {
-        auto elem = std::static_pointer_cast<Element>(child);
-        auto value = elem->getAttribute(attrName);
-        if (value.has_value() && value.value() == attrValue) {
-          result.push_back(elem);
-        }
-        elem->collectByAttribute(attrName, attrValue, result);
-      }
-    }
-  }
-
   std::string localName_;
   std::string namespaceUri_;
   std::string prefix_;
   std::vector<Attribute> attributes_;
   uint32_t stateFlags_ = 0;
 };
+
+// ── Out-of-line definitions needing the complete Element type ──
+inline std::shared_ptr<Element> Node::parentElement() const {
+  auto parent = parentNode();
+  if (parent && parent->nodeType() == NodeType::Element) {
+    return std::static_pointer_cast<Element>(parent);
+  }
+  return nullptr;
+}
+
+inline ElementPtr firstElementSiblingOf(const Node *node, bool backwards) {
+  NodePtr s = backwards ? node->previousSibling() : node->nextSibling();
+  while (s) {
+    if (s->nodeType() == NodeType::Element) {
+      return std::static_pointer_cast<Element>(s);
+    }
+    s = backwards ? s->previousSibling() : s->nextSibling();
+  }
+  return nullptr;
+}
+
+inline ElementPtr TextNode::previousElementSibling() const {
+  return firstElementSiblingOf(this, true);
+}
+
+inline ElementPtr TextNode::nextElementSibling() const {
+  return firstElementSiblingOf(this, false);
+}
+
+inline ElementPtr CommentNode::previousElementSibling() const {
+  return firstElementSiblingOf(this, true);
+}
+
+inline ElementPtr CommentNode::nextElementSibling() const {
+  return firstElementSiblingOf(this, false);
+}
+
+inline ElementPtr DocumentFragment::firstElementChild() const {
+  for (const auto &child : childNodes()) {
+    if (child->nodeType() == NodeType::Element) {
+      return std::static_pointer_cast<Element>(child);
+    }
+  }
+  return nullptr;
+}
+
+inline ElementPtr DocumentFragment::lastElementChild() const {
+  for (auto it = childNodes().rbegin(); it != childNodes().rend(); ++it) {
+    if ((*it)->nodeType() == NodeType::Element) {
+      return std::static_pointer_cast<Element>(*it);
+    }
+  }
+  return nullptr;
+}
+
+inline size_t DocumentFragment::childElementCount() const {
+  size_t count = 0;
+  for (const auto &child : childNodes()) {
+    if (child->nodeType() == NodeType::Element) {
+      count++;
+    }
+  }
+  return count;
+}
 
 class Document : public Node {
 public:
@@ -540,13 +697,11 @@ public:
     return nullptr;
   }
 
+  // WHATWG: the first element child of the document (not hard-coded to html)
   ElementPtr documentElement() const {
     for (const auto &child : childNodes_) {
       if (child->nodeType() == NodeType::Element) {
-        auto elem = std::static_pointer_cast<Element>(child);
-        if (toLower(elem->localName()) == "html") {
-          return elem;
-        }
+        return std::static_pointer_cast<Element>(child);
       }
     }
     return nullptr;
@@ -651,6 +806,30 @@ public:
     return std::make_shared<CommentNode>(data);
   }
 
+  std::shared_ptr<ProcessingInstructionNode>
+  createProcessingInstruction(const std::string &target,
+                              const std::string &data) {
+    return std::make_shared<ProcessingInstructionNode>(target, data);
+  }
+
+  // Deep-clone a node from another document into this one (no owner-document
+  // tracking yet, so import == clone; the API matches the WHATWG signature).
+  NodePtr importNode(const NodePtr &node, bool deep = true) {
+    if (!node)
+      return nullptr;
+    return node->cloneNode(deep);
+  }
+
+  // Remove a node from its current tree, transferring it to this document
+  NodePtr adoptNode(const NodePtr &node) {
+    if (!node)
+      return nullptr;
+    if (auto parent = node->parentNode()) {
+      parent->removeChild(node);
+    }
+    return node;
+  }
+
   NodePtr createDocumentType(const std::string &name,
                              const std::string &publicId = "",
                              const std::string &systemId = "") {
@@ -683,19 +862,25 @@ public:
     return html->getElementsByClassName(className);
   }
 
-  std::vector<ElementPtr> querySelectorAll(const std::string &selector) const {
-    auto html = documentElement();
-    if (!html)
-      return {};
-    return html->querySelectorAll(selector);
+  std::vector<ElementPtr> getElementsByName(const std::string &name) const {
+    std::vector<ElementPtr> result;
+    auto root = documentElement();
+    if (!root)
+      return result;
+    for (const auto &el : root->getElementsByTagName("*")) {
+      auto value = el->getAttribute("name");
+      if (value.has_value() && value.value() == name) {
+        result.push_back(el);
+      }
+    }
+    return result;
   }
 
-  ElementPtr querySelector(const std::string &selector) const {
-    auto html = documentElement();
-    if (!html)
-      return nullptr;
-    return html->querySelector(selector);
-  }
+  // Defined in dom/dom_enhancements.hpp (needs the selector engine).
+  // Unlike the element methods, the document itself is the search root, so
+  // documentElement is a candidate (e.g. document.querySelector("html")).
+  std::vector<ElementPtr> querySelectorAll(const std::string &selector) const;
+  ElementPtr querySelector(const std::string &selector) const;
 
   NodePtr cloneNode(bool deep = false) const override {
     auto cloned = std::make_shared<Document>();
@@ -739,81 +924,6 @@ private:
   std::string compatMode_ = "CSS1Compat";
   std::string doctypeName_;
 };
-
-inline std::vector<ElementPtr>
-Element::querySelectorAll(const std::string &selector) const {
-  std::vector<ElementPtr> result;
-
-  std::string trimmed = trimWhitespace(selector);
-  if (trimmed.empty())
-    return result;
-
-  if (trimmed[0] == '#') {
-    std::string id = trimmed.substr(1);
-    auto elem = getElementById(id);
-    if (elem) {
-      result.push_back(elem);
-    }
-  } else if (trimmed[0] == '.') {
-    std::string className = trimmed.substr(1);
-    result = getElementsByClassName(className);
-  } else if (trimmed[0] == '[') {
-    size_t eqPos = trimmed.find('=');
-    if (eqPos != std::string::npos) {
-      std::string attrName = trimmed.substr(1, eqPos - 1);
-      std::string attrValue = trimmed.substr(eqPos + 1);
-      // Strip trailing ]
-      if (!attrValue.empty() && attrValue.back() == ']') {
-        attrValue.pop_back();
-      }
-      if (attrValue.size() >= 2 &&
-          (attrValue[0] == '"' || attrValue[0] == '\'')) {
-        attrValue = attrValue.substr(1, attrValue.size() - 2);
-      }
-      collectByAttribute(attrName, attrValue, result);
-    }
-  } else {
-    result = getElementsByTagName(trimmed);
-  }
-
-  return result;
-}
-
-inline ElementPtr Element::querySelector(const std::string &selector) const {
-  auto results = querySelectorAll(selector);
-  return results.empty() ? nullptr : results[0];
-}
-
-inline bool Element::matches(const std::string &selector) const {
-  std::string trimmed = trimWhitespace(selector);
-  if (trimmed.empty())
-    return false;
-
-  if (trimmed[0] == '#') {
-    return id() == trimmed.substr(1);
-  } else if (trimmed[0] == '.') {
-    return hasClass(trimmed.substr(1));
-  } else if (trimmed[0] == '[') {
-    size_t eqPos = trimmed.find('=');
-    if (eqPos != std::string::npos) {
-      std::string attrName = trimmed.substr(1, eqPos - 1);
-      std::string attrValue = trimmed.substr(eqPos + 1);
-      // Strip trailing ]
-      if (!attrValue.empty() && attrValue.back() == ']') {
-        attrValue.pop_back();
-      }
-      if (attrValue.size() >= 2 &&
-          (attrValue[0] == '"' || attrValue[0] == '\'')) {
-        attrValue = attrValue.substr(1, attrValue.size() - 2);
-      }
-      auto value = getAttribute(attrName);
-      return value.has_value() && value.value() == attrValue;
-    }
-    return hasAttribute(trimmed.substr(1, trimmed.size() - 2));
-  } else {
-    return toLower(localName_) == toLower(trimmed);
-  }
-}
 
 } // namespace dom
 } // namespace xiaopeng

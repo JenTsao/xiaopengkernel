@@ -45,16 +45,18 @@ bool ScriptEngine::initialize() {
   TimerBinding::registerBinding(m_ctx);
   DOMBinding::registerBinding(m_ctx);
 
-  dom::EventSystem::setEventDispatchCallback([this](dom::NodePtr node, const std::shared_ptr<dom::Event> &event, dom::EventPhase) {
+  dom::EventSystem::setEventDispatchCallback([this](dom::NodePtr node, const std::shared_ptr<dom::Event> &event, dom::EventPhase phase) {
     if (!this->m_ctx || !node) return;
-    const auto *listenerIds = node->getEventListeners(event->type());
-    if (listenerIds && !listenerIds->empty()) {
+    // Only listeners registered for this phase fire (capture vs bubble),
+    // otherwise ancestor handlers run twice per event.
+    auto listenerIds = node->getListenerIdsForPhase(event->type(), phase);
+    if (!listenerIds.empty()) {
       // Create a full JS Event wrapper that connects back to the C++ event
       JSValue eventObj = DOMBinding::wrapEvent(this->m_ctx, event);
-      
-      // Dispatch the event to all listeners
-      EventBinding::dispatch(this->m_ctx, *listenerIds, eventObj);
-      
+
+      // Dispatch the event to the matching listeners
+      EventBinding::dispatch(this->m_ctx, listenerIds, eventObj);
+
       // Free our reference
       JS_FreeValue(this->m_ctx, eventObj);
     }

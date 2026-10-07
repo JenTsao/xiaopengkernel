@@ -158,7 +158,8 @@ enum class NodeType : uint8_t {
   Document,
   DocumentType,
   DocumentFragment,
-  CdataSection
+  CdataSection,
+  ProcessingInstruction
 };
 
 // Dirty flag for incremental update: Layout > Paint > Clean
@@ -177,9 +178,26 @@ enum class ElementState : uint32_t {
   Optional = 1 << 8
 };
 
+// Event phase constants (W3C standard)
+enum class EventPhase : uint8_t {
+  None = 0,
+  Capturing = 1,
+  AtTarget = 2,
+  Bubbling = 3
+};
+
+// A registered event listener: JS callback ID + capture/bubble preference
+struct EventListenerEntry {
+  uint32_t id = 0;
+  bool capture = false;
+};
+
 class Node;
 using NodePtr = std::shared_ptr<Node>;
 using WeakNodePtr = std::weak_ptr<Node>;
+
+class Element;
+using ElementPtr = std::shared_ptr<Element>;
 
 class Node : public std::enable_shared_from_this<Node> {
 public:
@@ -398,6 +416,117 @@ public:
     return false;
   }
 
+  // ParentNode mixin (WHATWG DOM): variadic insertion, strings become
+  // Text nodes via the JS binding layer.
+  void append(const std::vector<NodePtr> &nodes) {
+    for (const auto &n : flattenFragments(nodes)) {
+      appendChild(n);
+    }
+  }
+  void append(NodePtr node) { append(std::vector<NodePtr>{std::move(node)}); }
+
+  void prepend(const std::vector<NodePtr> &nodes) {
+    auto flat = flattenFragments(nodes);
+    for (size_t i = flat.size(); i-- > 0;) {
+      insertBefore(flat[i], firstChild_);
+    }
+  }
+  void prepend(NodePtr node) { prepend(std::vector<NodePtr>{std::move(node)}); }
+
+  void replaceChildren(const std::vector<NodePtr> &nodes) {
+    removeAllChildren();
+    append(nodes);
+  }
+  void replaceChildren(NodePtr node) {
+    replaceChildren(std::vector<NodePtr>{std::move(node)});
+  }
+
+  // ChildNode mixin (WHATWG DOM)
+  void remove() {
+    if (auto parent = parentNode_.lock()) {
+      parent->removeChild(shared_from_this());
+    }
+  }
+
+  void before(const std::vector<NodePtr> &nodes) {
+    auto parent = parentNode_.lock();
+    if (!parent)
+      return;
+    NodePtr self = shared_from_this();
+    for (const auto &n : flattenFragments(nodes)) {
+      parent->insertBefore(n, self);
+    }
+  }
+  void before(NodePtr node) { before(std::vector<NodePtr>{std::move(node)}); }
+
+  void after(const std::vector<NodePtr> &nodes) {
+    auto parent = parentNode_.lock();
+    if (!parent)
+      return;
+    NodePtr ref = nextSibling_.lock();
+    for (const auto &n : flattenFragments(nodes)) {
+      parent->insertBefore(n, ref);
+    }
+  }
+  void after(NodePtr node) { after(std::vector<NodePtr>{std::move(node)}); }
+
+  void replaceWith(const std::vector<NodePtr> &nodes) {
+    auto parent = parentNode_.lock();
+    if (!parent)
+      return;
+    before(nodes);
+    remove();
+  }
+  void replaceWith(NodePtr node) {
+    replaceWith(std::vector<NodePtr>{std::move(node)});
+  }
+
+  // NonDocumentTypeChildNode (Text/Comment element-sibling accessors) is
+  // declared on those classes; defined in dom.hpp where Element is complete.
+  std::shared_ptr<Element> parentElement() const;
+
+  bool isConnected() const {
+    auto root = const_cast<Node *>(this)->shared_from_this()->getRootNode();
+    return root && root->nodeType() == NodeType::Document;
+  }
+
+  // WHATWG DOM: isEqualNode — same type, same content (recursive)
+  bool isEqualNode(const NodePtr &other) const {
+    if (!other || other->nodeType() != nodeType_)
+      return false;
+    if (!isEqualNodeSelf(*other))
+      return false;
+    const auto &oc = other->childNodes_;
+    if (childNodes_.size() != oc.size())
+      return false;
+    for (size_t i = 0; i < childNodes_.size(); ++i) {
+      if (!childNodes_[i]->isEqualNode(oc[i]))
+        return false;
+    }
+    return true;
+  }
+
+  // Per-type content comparison (attributes for Element, data for text-like)
+  virtual bool isEqualNodeSelf(const Node &) const { return true; }
+
+  // DocumentFragment arguments are replaced by their children (spec semantics)
+  static std::vector<NodePtr>
+  flattenFragments(const std::vector<NodePtr> &nodes) {
+    std::vector<NodePtr> out;
+    out.reserve(nodes.size());
+    for (const auto &n : nodes) {
+      if (!n)
+        continue;
+      if (n->nodeType() == NodeType::DocumentFragment) {
+        auto children = n->childNodes();
+        out.insert(out.end(), children.begin(), children.end());
+      } else {
+        out.push_back(n);
+      }
+    }
+    return out;
+  }
+
   void removeAllChildren() {
     bool mutated = !childNodes_.empty();
     while (!childNodes_.empty()) {
@@ -426,35 +555,79 @@ protected:
 
 public:
   // Event listener IDs (the actual JS callbacks are stored in EventBinding)
-  // Map: eventType -> list of listener IDs
-  std::unordered_map<std::string, std::vector<uint32_t>> eventListenerIds_;
+  // Map: eventType -> registered listener entries
+  std::unordered_map<std::string, std::vector<EventListenerEntry>>
+      eventListenerIds_;
 
-  // Add an event listener
-  void addEventListener(const std::string &type, uint32_t listenerId) {
-    eventListenerIds_[type].push_back(listenerId);
+  void addEventListener(const std::string &type, uint32_t listenerId,
+                        bool capture = false) {
+    eventListenerIds_[type].push_back({listenerId, capture});
   }
 
-  // Remove an event listener
   void removeEventListener(const std::string &type, uint32_t listenerId) {
     auto it = eventListenerIds_.find(type);
     if (it != eventListenerIds_.end()) {
-      auto &ids = it->second;
-      ids.erase(std::remove(ids.begin(), ids.end(), listenerId), ids.end());
-      if (ids.empty()) {
+      auto &entries = it->second;
+      entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                   [listenerId](const EventListenerEntry &e) {
+                                     return e.id == listenerId;
+                                   }),
+                    entries.end());
+      if (entries.empty()) {
         eventListenerIds_.erase(it);
       }
     }
   }
 
-  // Get listeners for an event
-  const std::vector<uint32_t> *getEventListeners(const std::string &type) const {
+  // Listener IDs that fire for the given phase (WHATWG semantics: capture
+  // listeners fire while capturing, non-capture while bubbling; both fire
+  // at the target).
+  std::vector<uint32_t> getListenerIdsForPhase(const std::string &type,
+                                               EventPhase phase) const {
+    std::vector<uint32_t> ids;
     auto it = eventListenerIds_.find(type);
-    if (it != eventListenerIds_.end()) {
-      return &it->second;
+    if (it == eventListenerIds_.end())
+      return ids;
+    for (const auto &entry : it->second) {
+      if (phase == EventPhase::AtTarget || entry.capture ==
+                                               (phase == EventPhase::Capturing)) {
+        ids.push_back(entry.id);
+      }
     }
-    return nullptr;
+    return ids;
   }
 };
+
+// ── CharacterData helpers (shared by Text / Comment / ProcessingInstruction) ──
+inline std::string characterSubstringData(const std::string &data,
+                                          size_t offset, size_t count) {
+  if (offset >= data.size())
+    return "";
+  return data.substr(offset, count);
+}
+
+inline void characterAppendData(std::string &data, const std::string &arg) {
+  data += arg;
+}
+
+inline void characterInsertData(std::string &data, size_t offset,
+                                const std::string &arg) {
+  offset = std::min(offset, data.size());
+  data.insert(offset, arg);
+}
+
+inline void characterDeleteData(std::string &data, size_t offset,
+                                size_t count) {
+  if (offset >= data.size())
+    return;
+  data.erase(offset, count);
+}
+
+inline void characterReplaceData(std::string &data, size_t offset,
+                                 size_t count, const std::string &arg) {
+  offset = std::min(offset, data.size());
+  data.replace(offset, count, arg);
+}
 
 class TextNode : public Node {
 public:
@@ -462,7 +635,10 @@ public:
       : Node(NodeType::Text, "#text"), text_(text) {}
 
   const std::string &data() const { return text_; }
-  void setData(const std::string &text) { text_ = text; }
+  void setData(const std::string &text) {
+    text_ = text;
+    notifyMutation();
+  }
 
   std::string textContent() const override { return text_; }
   void setTextContent(const std::string &text) override {
@@ -471,6 +647,48 @@ public:
   }
 
   size_t length() const { return text_.length(); }
+
+  // CharacterData API
+  std::string substringData(size_t offset, size_t count) const {
+    return characterSubstringData(text_, offset, count);
+  }
+  void appendData(const std::string &arg) {
+    characterAppendData(text_, arg);
+    notifyMutation();
+  }
+  void insertData(size_t offset, const std::string &arg) {
+    characterInsertData(text_, offset, arg);
+    notifyMutation();
+  }
+  void deleteData(size_t offset, size_t count) {
+    characterDeleteData(text_, offset, count);
+    notifyMutation();
+  }
+  void replaceData(size_t offset, size_t count, const std::string &arg) {
+    characterReplaceData(text_, offset, count, arg);
+    notifyMutation();
+  }
+
+  // Text.splitText(offset): keep the first half here, return a new TextNode
+  // with the remainder inserted as this node's next sibling.
+  NodePtr splitText(size_t offset) {
+    size_t cut = std::min(offset, text_.size());
+    auto remainder = std::make_shared<TextNode>(text_.substr(cut));
+    text_ = text_.substr(0, cut);
+    notifyMutation();
+    if (auto parent = parentNode_.lock()) {
+      parent->insertBefore(remainder, nextSibling_.lock());
+    }
+    return remainder;
+  }
+
+  // NonDocumentTypeChildNode (defined in dom.hpp where Element is complete)
+  ElementPtr previousElementSibling() const;
+  ElementPtr nextElementSibling() const;
+
+  bool isEqualNodeSelf(const Node &other) const override {
+    return static_cast<const TextNode &>(other).text_ == text_;
+  }
 
   NodePtr cloneNode(bool = false) const override {
     return std::make_shared<TextNode>(text_);
@@ -510,10 +728,47 @@ public:
       : Node(NodeType::Comment, "#comment"), data_(data) {}
 
   const std::string &data() const { return data_; }
-  void setData(const std::string &data) { data_ = data; }
+  void setData(const std::string &data) {
+    data_ = data;
+    notifyMutation();
+  }
 
   std::string textContent() const override { return data_; }
-  void setTextContent(const std::string &data) override { data_ = data; }
+  void setTextContent(const std::string &data) override {
+    data_ = data;
+    notifyMutation();
+  }
+
+  size_t length() const { return data_.length(); }
+
+  // CharacterData API
+  std::string substringData(size_t offset, size_t count) const {
+    return characterSubstringData(data_, offset, count);
+  }
+  void appendData(const std::string &arg) {
+    characterAppendData(data_, arg);
+    notifyMutation();
+  }
+  void insertData(size_t offset, const std::string &arg) {
+    characterInsertData(data_, offset, arg);
+    notifyMutation();
+  }
+  void deleteData(size_t offset, size_t count) {
+    characterDeleteData(data_, offset, count);
+    notifyMutation();
+  }
+  void replaceData(size_t offset, size_t count, const std::string &arg) {
+    characterReplaceData(data_, offset, count, arg);
+    notifyMutation();
+  }
+
+  // NonDocumentTypeChildNode (defined in dom.hpp where Element is complete)
+  ElementPtr previousElementSibling() const;
+  ElementPtr nextElementSibling() const;
+
+  bool isEqualNodeSelf(const Node &other) const override {
+    return static_cast<const CommentNode &>(other).data_ == data_;
+  }
 
   NodePtr cloneNode(bool = false) const override {
     return std::make_shared<CommentNode>(data_);
@@ -522,6 +777,44 @@ public:
   std::string toHtml() const override { return "<!--" + data_ + "-->"; }
 
 private:
+  std::string data_;
+};
+
+class ProcessingInstructionNode : public Node {
+public:
+  ProcessingInstructionNode(const std::string &target,
+                            const std::string &data)
+      : Node(NodeType::ProcessingInstruction, target), target_(target),
+        data_(data) {}
+
+  const std::string &target() const { return target_; }
+  const std::string &data() const { return data_; }
+  void setData(const std::string &data) {
+    data_ = data;
+    notifyMutation();
+  }
+
+  std::string textContent() const override { return data_; }
+  void setTextContent(const std::string &data) override {
+    data_ = data;
+    notifyMutation();
+  }
+
+  bool isEqualNodeSelf(const Node &other) const override {
+    const auto &o = static_cast<const ProcessingInstructionNode &>(other);
+    return o.target_ == target_ && o.data_ == data_;
+  }
+
+  NodePtr cloneNode(bool = false) const override {
+    return std::make_shared<ProcessingInstructionNode>(target_, data_);
+  }
+
+  std::string toHtml() const override {
+    return "<?" + target_ + " " + data_ + "?>";
+  }
+
+private:
+  std::string target_;
   std::string data_;
 };
 
@@ -586,6 +879,15 @@ private:
 class DocumentFragment : public Node {
 public:
   DocumentFragment() : Node(NodeType::DocumentFragment, "#document-fragment") {}
+
+  // Defined in dom/dom_enhancements.hpp (needs the selector engine)
+  std::vector<ElementPtr> querySelectorAll(const std::string &selector) const;
+  ElementPtr querySelector(const std::string &selector) const;
+
+  // ParentNode members (defined in dom.hpp where Element is complete)
+  ElementPtr firstElementChild() const;
+  ElementPtr lastElementChild() const;
+  size_t childElementCount() const;
 
   NodePtr cloneNode(bool deep = false) const override {
     auto fragment = std::make_shared<DocumentFragment>();

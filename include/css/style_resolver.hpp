@@ -60,7 +60,8 @@ public:
     return style;
   }
 
-private:
+  // Match an element against a parsed complex selector (compound parts +
+  // combinators). Public so the DOM querySelector engine can reuse it.
   bool matchSelector(dom::ElementPtr element, const Selector &selector) {
     if (selector.parts.empty() || !element)
       return false;
@@ -71,6 +72,7 @@ private:
                             static_cast<int>(selector.parts.size()) - 1);
   }
 
+private:
   bool matchRecursively(dom::ElementPtr element, const Selector &selector,
                         int index) {
     if (index < 0)

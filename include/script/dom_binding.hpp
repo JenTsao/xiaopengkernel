@@ -2,6 +2,7 @@
 
 #include <cstring> // For memset
 #include <dom/dom.hpp>
+#include <dom/dom_enhancements.hpp>
 #include <dom/html_parser.hpp>
 #include <iostream>
 #include <memory>
@@ -116,6 +117,10 @@ public:
     bind("createTextNode",        document_createTextNode, 1);
     bind("createDocumentFragment", document_createDocumentFragment, 0);
     bind("createComment",         document_createComment, 1);
+    bind("createProcessingInstruction", document_createProcessingInstruction, 2);
+    bind("importNode",            document_importNode, 2);
+    bind("adoptNode",             document_adoptNode, 1);
+    bind("getElementsByName",     document_getElementsByName, 1);
     bind("addEventListener",      element_addEventListener, 2);
     bind("removeEventListener",   element_removeEventListener, 2);
     bind("dispatchEvent",         element_dispatchEvent, 1);
@@ -233,6 +238,11 @@ public:
     // --- NEW: childElementCount ---
     bindReadOnly(ctx, obj, "childElementCount", element_get_childElementCount);
 
+    // --- outerHTML (get/set), isConnected ---
+    bindGetSet(ctx, obj, "outerHTML",
+               element_get_outerHTML, element_set_outerHTML);
+    bindReadOnly(ctx, obj, "isConnected", node_get_isConnected);
+
     // --- Attribute methods ---
     auto bindMethod = [&](const char *name, JSCFunction func, int argc) {
       JS_SetPropertyStr(ctx, obj, name,
@@ -243,6 +253,23 @@ public:
     bindMethod("getAttribute",       element_getAttribute, 1);
     bindMethod("hasAttribute",       element_hasAttribute, 1);
     bindMethod("removeAttribute",    element_removeAttribute, 1);
+    bindMethod("getAttributeNames",  element_getAttributeNames, 0);
+    bindMethod("hasAttributes",      element_hasAttributes, 0);
+    bindMethod("toggleAttribute",    element_toggleAttribute, 2);
+
+    // --- WHATWG ParentNode / ChildNode (variadic, strings become Text) ---
+    bindMethod("append",          node_append, -1);
+    bindMethod("prepend",         node_prepend, -1);
+    bindMethod("replaceChildren", node_replaceChildren, -1);
+    bindMethod("before",          node_before, -1);
+    bindMethod("after",           node_after, -1);
+    bindMethod("replaceWith",     node_replaceWith, -1);
+
+    // --- insertAdjacent* + dataset ---
+    bindMethod("insertAdjacentHTML",    element_insertAdjacentHTML, 2);
+    bindMethod("insertAdjacentText",    element_insertAdjacentText, 2);
+    bindMethod("insertAdjacentElement", element_insertAdjacentElement, 2);
+    bindReadOnly(ctx, obj, "dataset", element_get_dataset);
 
     // --- DOM manipulation ---
     bindMethod("appendChild",        element_appendChild, 1);
@@ -290,14 +317,105 @@ public:
     bindReadOnly(ctx, obj, "parentElement", node_get_parentElement);
     bindReadOnly(ctx, obj, "nextSibling",   node_get_nextSibling);
     bindReadOnly(ctx, obj, "previousSibling", node_get_previousSibling);
+    bindReadOnly(ctx, obj, "nextElementSibling", text_get_nextElementSibling);
+    bindReadOnly(ctx, obj, "previousElementSibling", text_get_previousElementSibling);
+    bindReadOnly(ctx, obj, "isConnected",   node_get_isConnected);
     bindReadOnly(ctx, obj, "nodeName",      node_get_nodeName);
     bindReadOnly(ctx, obj, "nodeType",      node_get_nodeType);
     bindGetSet(ctx, obj, "nodeValue",       node_get_nodeValue, node_set_nodeValue);
     bindGetSet(ctx, obj, "textContent",     node_get_nodeValue, node_set_nodeValue);
     bindGetSet(ctx, obj, "data",            node_get_nodeValue, node_set_nodeValue);
+    JS_SetPropertyStr(ctx, obj, "splitText",
+                      JS_NewCFunction(ctx, text_splitText, "splitText", 1));
+
+    // CharacterData methods
+    auto bindTextMethod = [&](const char *name, JSCFunction func, int argc) {
+      JS_SetPropertyStr(ctx, obj, name,
+                        JS_NewCFunction(ctx, func, name, argc));
+    };
+    bindTextMethod("substringData", text_substringData, 2);
+    bindTextMethod("appendData",    text_appendData, 1);
+    bindTextMethod("insertData",    text_insertData, 2);
+    bindTextMethod("deleteData",    text_deleteData, 2);
+    bindTextMethod("replaceData",   text_replaceData, 3);
 
     return obj;
   }
+  // ── wrapFragment: DocumentFragment with node-manipulation methods ──
+  static JSValue wrapFragment(JSContext *ctx,
+                              std::shared_ptr<dom::DocumentFragment> frag) {
+    if (!frag) return JS_NULL;
+    {
+      std::lock_guard<std::mutex> lock(s_mutex);
+      s_createdNodes.push_back(frag);
+    }
+    JSValue obj = JS_NewObjectClass(ctx, s_elementClassId);
+    if (JS_IsException(obj)) return obj;
+
+    JS_SetOpaque(obj, static_cast<dom::Node *>(frag.get()));
+    JS_SetPropertyStr(ctx, obj, "nodeType", JS_NewInt32(ctx, 11));
+    JS_SetPropertyStr(ctx, obj, "nodeName",
+                      JSBinding::toJSString(ctx, frag->nodeName()));
+
+    auto bindMethod = [&](const char *name, JSCFunction func, int argc) {
+      JS_SetPropertyStr(ctx, obj, name,
+                        JS_NewCFunction(ctx, func, name, argc));
+    };
+    auto bindReadOnly = [&](const char *name, JSCFunction getter) {
+      JSAtom atom = JS_NewAtom(ctx, name);
+      JS_DefinePropertyGetSet(
+          ctx, obj, atom,
+          JS_NewCFunction(ctx, getter, (std::string("get_") + name).c_str(), 0),
+          JS_UNDEFINED,
+          JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+      JS_FreeAtom(ctx, atom);
+    };
+
+    bindMethod("appendChild",  element_appendChild, 1);
+    bindMethod("removeChild",  element_removeChild, 1);
+    bindMethod("insertBefore", element_insertBefore, 2);
+    bindMethod("replaceChild", element_replaceChild, 2);
+    bindMethod("append",       node_append, -1);
+    bindMethod("prepend",      node_prepend, -1);
+    bindMethod("replaceChildren", node_replaceChildren, -1);
+    bindMethod("cloneNode",    element_cloneNode, 1);
+    bindMethod("querySelector",       fragment_querySelector, 1);
+    bindMethod("querySelectorAll",    fragment_querySelectorAll, 1);
+    bindReadOnly("childNodes",        node_get_childNodes);
+    bindReadOnly("children",          node_get_children);
+    bindReadOnly("firstChild",        node_get_firstChild);
+    bindReadOnly("lastChild",         node_get_lastChild);
+    bindReadOnly("firstElementChild", node_get_firstElementChild);
+    bindReadOnly("lastElementChild",  node_get_lastElementChild);
+
+    return obj;
+  }
+
+  // fragment.querySelector(selector)
+  static JSValue fragment_querySelector(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::DocumentFragment || argc < 1)
+      return JS_EXCEPTION;
+    auto frag = std::static_pointer_cast<dom::DocumentFragment>(
+        node->shared_from_this());
+    auto found = frag->querySelector(JSBinding::toStdString(ctx, argv[0]));
+    return found ? wrapElement(ctx, found.get()) : JS_NULL;
+  }
+
+  // fragment.querySelectorAll(selector)
+  static JSValue fragment_querySelectorAll(JSContext *ctx,
+                                           JSValueConst this_val, int argc,
+                                           JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::DocumentFragment || argc < 1)
+      return JS_EXCEPTION;
+    auto frag = std::static_pointer_cast<dom::DocumentFragment>(
+        node->shared_from_this());
+    return wrapElementArray(
+        ctx, frag->querySelectorAll(JSBinding::toStdString(ctx, argv[0])));
+  }
+
   // ── wrapEvent ────────────────────────────────────────────────
   static JSValue wrapEvent(JSContext *ctx, std::shared_ptr<dom::Event> ev) {
     if (!ev) return JS_NULL;
@@ -352,6 +470,46 @@ private:
     return node;
   }
 
+  // ── Helper: shared_ptr to any wrapped node (Element, Text, Fragment) ──
+  static dom::NodePtr getNodeArg(JSContext *ctx, JSValueConst value) {
+    (void)ctx;
+    dom::Node *node = (dom::Node *)JS_GetOpaque(value, s_elementClassId);
+    if (!node)
+      node = (dom::Node *)JS_GetOpaque(value, s_textNodeClassId);
+    if (!node)
+      return nullptr;
+    try {
+      return node->shared_from_this();
+    } catch (...) {
+      return nullptr;
+    }
+  }
+
+  // ── Helper: variadic node arguments; strings become Text nodes ──
+  static std::vector<dom::NodePtr> getNodeArgs(JSContext *ctx, int argc,
+                                               JSValueConst *argv) {
+    std::vector<dom::NodePtr> out;
+    out.reserve((size_t)argc);
+    for (int i = 0; i < argc; ++i) {
+      if (dom::NodePtr n = getNodeArg(ctx, argv[i])) {
+        out.push_back(n);
+      } else if (JS_IsString(argv[i])) {
+        out.push_back(
+            std::make_shared<dom::TextNode>(JSBinding::toStdString(ctx, argv[i])));
+      }
+    }
+    return out;
+  }
+
+  // ── Helper: Element* from this, rejecting non-element receivers ──
+  static dom::Element *getElementFromThis(JSContext *ctx,
+                                          JSValueConst this_val) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Element)
+      return nullptr;
+    return static_cast<dom::Element *>(node);
+  }
+
   // ── Helper: bind read-only getter ──
   static void bindReadOnly(JSContext *ctx, JSValue obj, const char *name,
                            JSCFunction getter) {
@@ -386,12 +544,23 @@ public:
     } else if (node->nodeType() == dom::NodeType::Text) {
       return wrapTextNode(ctx, static_cast<dom::TextNode *>(node.get()));
     }
-    // Comment, DocumentType etc. → return as generic object with nodeType
+    // Comment, ProcessingInstruction etc. → generic object with nodeType
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "nodeType",
                       JS_NewInt32(ctx, static_cast<int>(node->nodeType())));
     JS_SetPropertyStr(ctx, obj, "nodeName",
                       JSBinding::toJSString(ctx, node->nodeName()));
+    if (node->nodeType() == dom::NodeType::Comment) {
+      auto *comment = static_cast<dom::CommentNode *>(node.get());
+      JS_SetPropertyStr(ctx, obj, "data",
+                        JSBinding::toJSString(ctx, comment->data()));
+    } else if (node->nodeType() == dom::NodeType::ProcessingInstruction) {
+      auto *pi = static_cast<dom::ProcessingInstructionNode *>(node.get());
+      JS_SetPropertyStr(ctx, obj, "target",
+                        JSBinding::toJSString(ctx, pi->target()));
+      JS_SetPropertyStr(ctx, obj, "data",
+                        JSBinding::toJSString(ctx, pi->data()));
+    }
     return obj;
   }
 
@@ -579,13 +748,7 @@ public:
     if (!doc) return JS_EXCEPTION;
     auto frag = doc->createDocumentFragment();
     if (!frag) return JS_NULL;
-    JSValue obj = JS_NewObjectClass(ctx, s_elementClassId);
-    if (JS_IsException(obj)) return obj;
-    JS_SetOpaque(obj, static_cast<dom::Node *>(frag.get()));
-    { std::lock_guard<std::mutex> lock(s_mutex); s_createdNodes.push_back(frag); }
-    JS_SetPropertyStr(ctx, obj, "nodeType", JS_NewInt32(ctx, 11));
-    JS_SetPropertyStr(ctx, obj, "nodeName", JS_NewString(ctx, "#document-fragment"));
-    return obj;
+    return wrapFragment(ctx, frag);
   }
 
   // document.createComment(data)
@@ -604,6 +767,61 @@ public:
     JS_SetPropertyStr(ctx, obj, "data",
                       JSBinding::toJSString(ctx, JSBinding::toStdString(ctx, argv[0])));
     return obj;
+  }
+
+  // document.createProcessingInstruction(target, data)
+  static JSValue document_createProcessingInstruction(JSContext *ctx,
+                                                       JSValueConst this_val,
+                                                       int argc,
+                                                       JSValueConst *argv) {
+    auto *doc = getDoc(ctx, this_val);
+    if (!doc || argc < 2) return JS_EXCEPTION;
+    auto pi = doc->createProcessingInstruction(
+        JSBinding::toStdString(ctx, argv[0]),
+        JSBinding::toStdString(ctx, argv[1]));
+    if (!pi) return JS_NULL;
+    { std::lock_guard<std::mutex> lock(s_mutex); s_createdNodes.push_back(pi); }
+    return wrapNode(ctx, pi);
+  }
+
+  // document.importNode(node[, deep=true])
+  static JSValue document_importNode(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    auto *doc = getDoc(ctx, this_val);
+    if (!doc || argc < 1) return JS_EXCEPTION;
+    auto node = getNodeArg(ctx, argv[0]);
+    if (!node) {
+      JS_ThrowTypeError(ctx, "importNode: argument is not a Node");
+      return JS_EXCEPTION;
+    }
+    bool deep = argc < 2 || JS_ToBool(ctx, argv[1]) != 0;
+    auto imported = doc->importNode(node, deep);
+    { std::lock_guard<std::mutex> lock(s_mutex); s_createdNodes.push_back(imported); }
+    return wrapNode(ctx, imported);
+  }
+
+  // document.adoptNode(node)
+  static JSValue document_adoptNode(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    auto *doc = getDoc(ctx, this_val);
+    if (!doc || argc < 1) return JS_EXCEPTION;
+    auto node = getNodeArg(ctx, argv[0]);
+    if (!node) {
+      JS_ThrowTypeError(ctx, "adoptNode: argument is not a Node");
+      return JS_EXCEPTION;
+    }
+    auto adopted = doc->adoptNode(node);
+    return wrapNode(ctx, adopted);
+  }
+
+  // document.getElementsByName(name)
+  static JSValue document_getElementsByName(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+    auto *doc = getDoc(ctx, this_val);
+    if (!doc || argc < 1) return JS_EXCEPTION;
+    return wrapElementArray(
+        ctx, doc->getElementsByName(JSBinding::toStdString(ctx, argv[0])));
   }
 
   // document.body (getter)
@@ -731,11 +949,11 @@ public:
   static JSValue node_get_children(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv) {
     (void)argc; (void)argv;
-    dom::Element *el = (dom::Element *)JS_GetOpaque(this_val, s_elementClassId);
-    if (!el) return JS_EXCEPTION;
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
     JSValue arr = JS_NewArray(ctx);
     uint32_t idx = 0;
-    for (const auto &child : el->childNodes()) {
+    for (const auto &child : node->childNodes()) {
       if (child->nodeType() == dom::NodeType::Element) {
         JS_DefinePropertyValueUint32(
             ctx, arr, idx++,
@@ -768,20 +986,34 @@ public:
   static JSValue node_get_firstElementChild(JSContext *ctx, JSValueConst this_val,
                                              int argc, JSValueConst *argv) {
     (void)argc; (void)argv;
-    dom::Element *el = (dom::Element *)JS_GetOpaque(this_val, s_elementClassId);
-    if (!el) return JS_EXCEPTION;
-    auto child = el->firstElementChild();
-    return child ? wrapElement(ctx, child.get()) : JS_NULL;
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    if (node->nodeType() == dom::NodeType::Element) {
+      auto child = static_cast<dom::Element *>(node)->firstElementChild();
+      return child ? wrapElement(ctx, child.get()) : JS_NULL;
+    }
+    if (node->nodeType() == dom::NodeType::DocumentFragment) {
+      auto child = static_cast<dom::DocumentFragment *>(node)->firstElementChild();
+      return child ? wrapElement(ctx, child.get()) : JS_NULL;
+    }
+    return JS_NULL;
   }
 
   // node.lastElementChild
   static JSValue node_get_lastElementChild(JSContext *ctx, JSValueConst this_val,
                                             int argc, JSValueConst *argv) {
     (void)argc; (void)argv;
-    dom::Element *el = (dom::Element *)JS_GetOpaque(this_val, s_elementClassId);
-    if (!el) return JS_EXCEPTION;
-    auto child = el->lastElementChild();
-    return child ? wrapElement(ctx, child.get()) : JS_NULL;
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    if (node->nodeType() == dom::NodeType::Element) {
+      auto child = static_cast<dom::Element *>(node)->lastElementChild();
+      return child ? wrapElement(ctx, child.get()) : JS_NULL;
+    }
+    if (node->nodeType() == dom::NodeType::DocumentFragment) {
+      auto child = static_cast<dom::DocumentFragment *>(node)->lastElementChild();
+      return child ? wrapElement(ctx, child.get()) : JS_NULL;
+    }
+    return JS_NULL;
   }
 
   // node.nextSibling
@@ -1023,9 +1255,360 @@ public:
   static JSValue element_get_childElementCount(JSContext *ctx, JSValueConst this_val,
                                                 int argc, JSValueConst *argv) {
     (void)argc; (void)argv;
-    dom::Element *el = (dom::Element *)JS_GetOpaque(this_val, s_elementClassId);
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    if (node->nodeType() == dom::NodeType::Element) {
+      return JS_NewInt32(ctx, (int32_t)static_cast<dom::Element *>(node)->childElementCount());
+    }
+    if (node->nodeType() == dom::NodeType::DocumentFragment) {
+      return JS_NewInt32(ctx, (int32_t)static_cast<dom::DocumentFragment *>(node)->childElementCount());
+    }
+    return JS_NewInt32(ctx, 0);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  EXTENDED DOM APIs (WHATWG DOM completion)
+  // ══════════════════════════════════════════════════════════
+
+  // node.isConnected
+  static JSValue node_get_isConnected(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    return JS_NewBool(ctx, node->isConnected());
+  }
+
+  // element.outerHTML (getter)
+  static JSValue element_get_outerHTML(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    dom::Element *el = getElementFromThis(ctx, this_val);
     if (!el) return JS_EXCEPTION;
-    return JS_NewInt32(ctx, (int32_t)el->childElementCount());
+    return JSBinding::toJSString(ctx, el->outerHTML());
+  }
+
+  // element.outerHTML = html
+  static JSValue element_set_outerHTML(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+    dom::Element *el = getElementFromThis(ctx, this_val);
+    if (!el || argc < 1) return JS_EXCEPTION;
+    el->setOuterHTML(JSBinding::toStdString(ctx, argv[0]));
+    return JS_UNDEFINED;
+  }
+
+  // node.append(nodes/text...)
+  static JSValue node_append(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    node->append(getNodeArgs(ctx, argc, argv));
+    return JS_UNDEFINED;
+  }
+
+  // node.prepend(nodes/text...)
+  static JSValue node_prepend(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    node->prepend(getNodeArgs(ctx, argc, argv));
+    return JS_UNDEFINED;
+  }
+
+  // node.replaceChildren(nodes/text...)
+  static JSValue node_replaceChildren(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    node->replaceChildren(getNodeArgs(ctx, argc, argv));
+    return JS_UNDEFINED;
+  }
+
+  // node.before(nodes/text...)
+  static JSValue node_before(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    node->before(getNodeArgs(ctx, argc, argv));
+    return JS_UNDEFINED;
+  }
+
+  // node.after(nodes/text...)
+  static JSValue node_after(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    node->after(getNodeArgs(ctx, argc, argv));
+    return JS_UNDEFINED;
+  }
+
+  // node.replaceWith(nodes/text...)
+  static JSValue node_replaceWith(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) return JS_EXCEPTION;
+    node->replaceWith(getNodeArgs(ctx, argc, argv));
+    return JS_UNDEFINED;
+  }
+
+  // element.getAttributeNames()
+  static JSValue element_getAttributeNames(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    dom::Element *el = getElementFromThis(ctx, this_val);
+    if (!el) return JS_EXCEPTION;
+    JSValue arr = JS_NewArray(ctx);
+    auto names = el->getAttributeNames();
+    for (size_t i = 0; i < names.size(); ++i) {
+      JS_DefinePropertyValueUint32(
+          ctx, arr, (uint32_t)i, JSBinding::toJSString(ctx, names[i]),
+          JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE);
+    }
+    return arr;
+  }
+
+  // element.hasAttributes()
+  static JSValue element_hasAttributes(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    dom::Element *el = getElementFromThis(ctx, this_val);
+    if (!el) return JS_EXCEPTION;
+    return JS_NewBool(ctx, el->hasAttributes());
+  }
+
+  // element.toggleAttribute(name[, force])
+  static JSValue element_toggleAttribute(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+    dom::Element *el = getElementFromThis(ctx, this_val);
+    if (!el || argc < 1) return JS_EXCEPTION;
+    std::string name = JSBinding::toStdString(ctx, argv[0]);
+    bool hasForce = argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]);
+    bool result;
+    if (hasForce) {
+      result = el->toggleAttribute(name, JS_ToBool(ctx, argv[1]) != 0);
+    } else {
+      el->toggleAttribute(name);
+      result = el->hasAttribute(name);
+    }
+    return JS_NewBool(ctx, result);
+  }
+
+  // element.insertAdjacentHTML(position, html)
+  static JSValue element_insertAdjacentHTML(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+    dom::Element *el = getElementFromThis(ctx, this_val);
+    if (!el || argc < 2) return JS_EXCEPTION;
+    el->insertAdjacentHTML(JSBinding::toStdString(ctx, argv[0]),
+                           JSBinding::toStdString(ctx, argv[1]));
+    return JS_UNDEFINED;
+  }
+
+  // element.insertAdjacentText(position, text)
+  static JSValue element_insertAdjacentText(JSContext *ctx,
+                                            JSValueConst this_val, int argc,
+                                            JSValueConst *argv) {
+    dom::Element *el = getElementFromThis(ctx, this_val);
+    if (!el || argc < 2) return JS_EXCEPTION;
+    el->insertAdjacentText(JSBinding::toStdString(ctx, argv[0]),
+                           JSBinding::toStdString(ctx, argv[1]));
+    return JS_UNDEFINED;
+  }
+
+  // element.insertAdjacentElement(position, element)
+  static JSValue element_insertAdjacentElement(JSContext *ctx,
+                                               JSValueConst this_val, int argc,
+                                               JSValueConst *argv) {
+    dom::Element *el = getElementFromThis(ctx, this_val);
+    if (!el || argc < 2) return JS_EXCEPTION;
+    auto element = getNodeArg(ctx, argv[1]);
+    if (!element || element->nodeType() != dom::NodeType::Element) {
+      JS_ThrowTypeError(ctx, "insertAdjacentElement: argument is not an Element");
+      return JS_EXCEPTION;
+    }
+    el->insertAdjacentElement(
+        JSBinding::toStdString(ctx, argv[0]),
+        std::static_pointer_cast<dom::Element>(element));
+    return JS_DupValue(ctx, argv[1]);
+  }
+
+  // ── element.dataset (get/set/has/delete/keys over data-* attributes) ──
+
+  static dom::Element *datasetElement(JSContext *ctx, JSValueConst this_val) {
+    JSValue elVal = JS_GetPropertyStr(ctx, this_val, "__el");
+    uint64_t ptr = 0;
+    int rc = JS_GetBigUint64(ctx, elVal, &ptr);
+    JS_FreeValue(ctx, elVal);
+    if (rc < 0 || ptr == 0)
+      return nullptr;
+    return (dom::Element *)(uintptr_t)ptr;
+  }
+
+  // element.dataset (getter): object with get/set/has/delete/keys
+  static JSValue element_get_dataset(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    dom::Element *el = getElementFromThis(ctx, this_val);
+    if (!el) return JS_EXCEPTION;
+    JSValue obj = JS_NewObject(ctx);
+    // Keep the element pointer reachable for the dataset methods
+    JS_SetPropertyStr(ctx, obj, "__el",
+                      JS_NewBigUint64(ctx, (uint64_t)(uintptr_t)el));
+    auto bind = [&](const char *name, JSCFunction func, int n) {
+      JS_SetPropertyStr(ctx, obj, name, JS_NewCFunction(ctx, func, name, n));
+    };
+    bind("get",    dataset_get,    1);
+    bind("set",    dataset_set,    2);
+    bind("has",    dataset_has,    1);
+    bind("delete", dataset_delete, 1);
+    bind("keys",   dataset_keys,   0);
+    return obj;
+  }
+
+  static JSValue dataset_get(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    dom::Element *el = datasetElement(ctx, this_val);
+    if (!el || argc < 1) return JS_EXCEPTION;
+    auto value = el->getDataset(JSBinding::toStdString(ctx, argv[0]));
+    return value.has_value() ? JSBinding::toJSString(ctx, value.value())
+                             : JS_NULL;
+  }
+
+  static JSValue dataset_set(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    dom::Element *el = datasetElement(ctx, this_val);
+    if (!el || argc < 2) return JS_EXCEPTION;
+    el->setDataset(JSBinding::toStdString(ctx, argv[0]),
+                   JSBinding::toStdString(ctx, argv[1]));
+    return JS_UNDEFINED;
+  }
+
+  static JSValue dataset_has(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    dom::Element *el = datasetElement(ctx, this_val);
+    if (!el || argc < 1) return JS_EXCEPTION;
+    return JS_NewBool(ctx, el->hasDataset(JSBinding::toStdString(ctx, argv[0])));
+  }
+
+  static JSValue dataset_delete(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    dom::Element *el = datasetElement(ctx, this_val);
+    if (!el || argc < 1) return JS_EXCEPTION;
+    el->deleteDataset(JSBinding::toStdString(ctx, argv[0]));
+    return JS_UNDEFINED;
+  }
+
+  static JSValue dataset_keys(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    dom::Element *el = datasetElement(ctx, this_val);
+    if (!el) return JS_EXCEPTION;
+    JSValue arr = JS_NewArray(ctx);
+    auto keys = el->datasetKeys();
+    for (size_t i = 0; i < keys.size(); ++i) {
+      JS_DefinePropertyValueUint32(
+          ctx, arr, (uint32_t)i, JSBinding::toJSString(ctx, keys[i]),
+          JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE);
+    }
+    return arr;
+  }
+
+  // ── Text: CharacterData API + splitText + element siblings ──
+
+  static JSValue text_substringData(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Text) return JS_EXCEPTION;
+    int32_t offset = 0, count = 0;
+    if (argc >= 1) JS_ToInt32(ctx, &offset, argv[0]);
+    if (argc >= 2) JS_ToInt32(ctx, &count, argv[1]);
+    auto *text = static_cast<dom::TextNode *>(node);
+    return JSBinding::toJSString(
+        ctx, text->substringData((size_t)std::max(0, offset),
+                                 (size_t)std::max(0, count)));
+  }
+
+  static JSValue text_appendData(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Text || argc < 1)
+      return JS_EXCEPTION;
+    static_cast<dom::TextNode *>(node)->appendData(
+        JSBinding::toStdString(ctx, argv[0]));
+    return JS_UNDEFINED;
+  }
+
+  static JSValue text_insertData(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Text || argc < 2)
+      return JS_EXCEPTION;
+    int32_t offset = 0;
+    JS_ToInt32(ctx, &offset, argv[0]);
+    static_cast<dom::TextNode *>(node)->insertData(
+        (size_t)std::max(0, offset), JSBinding::toStdString(ctx, argv[1]));
+    return JS_UNDEFINED;
+  }
+
+  static JSValue text_deleteData(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Text || argc < 2)
+      return JS_EXCEPTION;
+    int32_t offset = 0, count = 0;
+    JS_ToInt32(ctx, &offset, argv[0]);
+    JS_ToInt32(ctx, &count, argv[1]);
+    static_cast<dom::TextNode *>(node)->deleteData((size_t)std::max(0, offset),
+                                                   (size_t)std::max(0, count));
+    return JS_UNDEFINED;
+  }
+
+  static JSValue text_replaceData(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Text || argc < 3)
+      return JS_EXCEPTION;
+    int32_t offset = 0, count = 0;
+    JS_ToInt32(ctx, &offset, argv[0]);
+    JS_ToInt32(ctx, &count, argv[1]);
+    static_cast<dom::TextNode *>(node)->replaceData(
+        (size_t)std::max(0, offset), (size_t)std::max(0, count),
+        JSBinding::toStdString(ctx, argv[2]));
+    return JS_UNDEFINED;
+  }
+
+  static JSValue text_splitText(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Text || argc < 1)
+      return JS_EXCEPTION;
+    int32_t offset = 0;
+    JS_ToInt32(ctx, &offset, argv[0]);
+    auto *text = static_cast<dom::TextNode *>(node);
+    dom::NodePtr remainder = text->splitText((size_t)std::max(0, offset));
+    { std::lock_guard<std::mutex> lock(s_mutex); s_createdNodes.push_back(remainder); }
+    return wrapTextNode(ctx, static_cast<dom::TextNode *>(remainder.get()));
+  }
+
+  // text.nextElementSibling / text.previousElementSibling
+  static JSValue text_get_nextElementSibling(JSContext *ctx,
+                                             JSValueConst this_val, int argc,
+                                             JSValueConst *argv) {
+    (void)argc; (void)argv;
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Text) return JS_EXCEPTION;
+    auto sibling = static_cast<dom::TextNode *>(node)->nextElementSibling();
+    return sibling ? wrapElement(ctx, sibling.get()) : JS_NULL;
+  }
+
+  static JSValue text_get_previousElementSibling(JSContext *ctx,
+                                                 JSValueConst this_val,
+                                                 int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Text) return JS_EXCEPTION;
+    auto sibling = static_cast<dom::TextNode *>(node)->previousElementSibling();
+    return sibling ? wrapElement(ctx, sibling.get()) : JS_NULL;
   }
 
   // ══════════════════════════════════════════════════════════
@@ -1144,37 +1727,19 @@ public:
     return JS_UNDEFINED;
   }
 
-  // element.appendChild(child)
+  // element.appendChild(child) — accepts Element, Text and DocumentFragment
   static JSValue element_appendChild(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv) {
-    dom::Element *parent = (dom::Element *)JS_GetOpaque(this_val, s_elementClassId);
+    dom::Node *parent = getNodeFromThis(ctx, this_val);
     if (!parent || argc < 1) return JS_EXCEPTION;
 
-    // Try getting as Element
-    dom::Element *child = (dom::Element *)JS_GetOpaque(argv[0], s_elementClassId);
-    if (child) {
-      try {
-        parent->appendChild(child->shared_from_this());
-      } catch (...) {
-        std::cout << "[DOM] Warning: appendChild failed" << std::endl;
-        return JS_EXCEPTION;
-      }
-      return JS_DupValue(ctx, argv[0]);
+    dom::NodePtr child = getNodeArg(ctx, argv[0]);
+    if (!child) {
+      JS_ThrowTypeError(ctx, "Argument is not a Node");
+      return JS_EXCEPTION;
     }
-
-    // Try getting as TextNode
-    dom::TextNode *textChild = (dom::TextNode *)JS_GetOpaque(argv[0], s_textNodeClassId);
-    if (textChild) {
-      try {
-        parent->appendChild(textChild->shared_from_this());
-      } catch (...) {
-        std::cout << "[DOM] Warning: appendChild (text) failed" << std::endl;
-        return JS_EXCEPTION;
-      }
-      return JS_DupValue(ctx, argv[0]);
-    }
-
-    return JS_EXCEPTION;
+    parent->appendChild(child);
+    return JS_DupValue(ctx, argv[0]);
   }
 
   // element.removeChild(child)
@@ -1186,79 +1751,42 @@ public:
         return JS_EXCEPTION;
     }
 
-    // Try Element child
-    dom::Element *child = (dom::Element *)JS_GetOpaque(argv[0], s_elementClassId);
-    if (child) {
-      try {
-        parent->removeChild(child->shared_from_this());
-      } catch (...) { 
-          JS_ThrowInternalError(ctx, "Failed to remove element child");
-          return JS_EXCEPTION; 
-      }
-      return JS_DupValue(ctx, argv[0]);
+    dom::NodePtr child = getNodeArg(ctx, argv[0]);
+    if (!child) {
+      JS_ThrowTypeError(ctx, "Argument is not a Node");
+      return JS_EXCEPTION;
     }
-
-    // Try TextNode child
-    dom::TextNode *textChild = (dom::TextNode *)JS_GetOpaque(argv[0], s_textNodeClassId);
-    if (textChild) {
-      try {
-        parent->removeChild(textChild->shared_from_this());
-      } catch (...) { 
-          JS_ThrowInternalError(ctx, "Failed to remove text child");
-          return JS_EXCEPTION; 
-      }
-      return JS_DupValue(ctx, argv[0]);
-    }
-
-    JS_ThrowTypeError(ctx, "Argument is not a Node");
-    return JS_EXCEPTION;
+    parent->removeChild(child);
+    return JS_DupValue(ctx, argv[0]);
   }
 
-  // ── NEW: element.insertBefore(newNode, referenceNode) ──
-  // Delegates to Node::insertBefore which handles parent tracking
+  // element.insertBefore(newNode, referenceNode) — accepts any node;
+  // null/undefined reference appends at the end
   static JSValue element_insertBefore(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv) {
     dom::Node *parent = getNodeFromThis(ctx, this_val);
     if (!parent || argc < 2) return JS_EXCEPTION;
 
-    // Get the new node (Element or TextNode)
-    dom::NodePtr newNode;
-    dom::Element *newEl = (dom::Element *)JS_GetOpaque(argv[0], s_elementClassId);
-    if (newEl) {
-      try { newNode = newEl->shared_from_this(); } catch (...) { return JS_EXCEPTION; }
-    } else {
-      dom::TextNode *newText = (dom::TextNode *)JS_GetOpaque(argv[0], s_textNodeClassId);
-      if (newText) {
-        try { newNode = newText->shared_from_this(); } catch (...) { return JS_EXCEPTION; }
-      } else {
+    dom::NodePtr newNode = getNodeArg(ctx, argv[0]);
+    if (!newNode) {
+      JS_ThrowTypeError(ctx, "New child is not a Node");
+      return JS_EXCEPTION;
+    }
+
+    dom::NodePtr refNode;
+    if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+      refNode = getNodeArg(ctx, argv[1]);
+      if (!refNode) {
+        JS_ThrowTypeError(ctx, "Reference child is not a Node");
         return JS_EXCEPTION;
       }
     }
 
-    // Get reference node (null/undefined → append at end)
-    dom::NodePtr refNode;
-    if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
-      dom::Element *refEl = (dom::Element *)JS_GetOpaque(argv[1], s_elementClassId);
-      if (refEl) {
-        try { refNode = refEl->shared_from_this(); } catch (...) { JS_ThrowInternalError(ctx, "err"); return JS_EXCEPTION; }
-      } else {
-        dom::TextNode *refText = (dom::TextNode *)JS_GetOpaque(argv[1], s_textNodeClassId);
-        if (refText) {
-          try { refNode = refText->shared_from_this(); } catch (...) { JS_ThrowInternalError(ctx, "err"); return JS_EXCEPTION; }
-        } else {
-          JS_ThrowTypeError(ctx, "Reference child is not a Node");
-          return JS_EXCEPTION;
-        }
-      }
-    }
-
-    // Delegate to the existing Node::insertBefore
     parent->insertBefore(newNode, refNode);
     return JS_DupValue(ctx, argv[0]);
   }
 
-  // ── NEW: element.replaceChild(newChild, oldChild) ──
-  // Delegates to Node::replaceChild
+  // element.replaceChild(newChild, oldChild) — accepts any node
   static JSValue element_replaceChild(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv) {
     dom::Node *parent = getNodeFromThis(ctx, this_val);
@@ -1267,34 +1795,22 @@ public:
         return JS_EXCEPTION;
     }
 
-    // Get new child
-    dom::NodePtr newChild;
-    dom::Element *newEl = (dom::Element *)JS_GetOpaque(argv[0], s_elementClassId);
-    if (newEl) {
-      try { newChild = newEl->shared_from_this(); } catch (...) { JS_ThrowInternalError(ctx, "err"); return JS_EXCEPTION; }
-    } else {
-      dom::TextNode *newText = (dom::TextNode *)JS_GetOpaque(argv[0], s_textNodeClassId);
-      if (newText) { try { newChild = newText->shared_from_this(); } catch (...) { JS_ThrowInternalError(ctx, "err"); return JS_EXCEPTION; } }
-      else { JS_ThrowTypeError(ctx, "New child is not a Node"); return JS_EXCEPTION; }
+    dom::NodePtr newChild = getNodeArg(ctx, argv[0]);
+    if (!newChild) {
+      JS_ThrowTypeError(ctx, "New child is not a Node");
+      return JS_EXCEPTION;
     }
-
-    // Get old child
-    dom::NodePtr oldChild;
-    dom::Element *oldEl = (dom::Element *)JS_GetOpaque(argv[1], s_elementClassId);
-    if (oldEl) {
-      try { oldChild = oldEl->shared_from_this(); } catch (...) { JS_ThrowInternalError(ctx, "err"); return JS_EXCEPTION; }
-    } else {
-      dom::TextNode *oldText = (dom::TextNode *)JS_GetOpaque(argv[1], s_textNodeClassId);
-      if (oldText) { try { oldChild = oldText->shared_from_this(); } catch (...) { JS_ThrowInternalError(ctx, "err"); return JS_EXCEPTION; } }
-      else { JS_ThrowTypeError(ctx, "Old child is not a Node"); return JS_EXCEPTION; }
+    dom::NodePtr oldChild = getNodeArg(ctx, argv[1]);
+    if (!oldChild) {
+      JS_ThrowTypeError(ctx, "Old child is not a Node");
+      return JS_EXCEPTION;
     }
 
     parent->replaceChild(newChild, oldChild);
     return JS_DupValue(ctx, argv[1]);
   }
 
-  // ── NEW: element.remove() ──
-  // Delegates to Node::removeChild on parent
+  // element.remove()
   static JSValue element_remove(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv) {
     (void)argc; (void)argv;
@@ -1303,13 +1819,7 @@ public:
         JS_ThrowTypeError(ctx, "Invalid node");
         return JS_EXCEPTION;
     }
-
-    auto parent = node->parentNode();
-    if (parent) {
-      try {
-        parent->removeChild(node->shared_from_this());
-      } catch (...) {}
-    }
+    node->remove();
     return JS_UNDEFINED;
   }
 
@@ -1450,7 +1960,7 @@ public:
 
   // ── Event methods ──
 
-  // element.addEventListener(type, callback)
+  // element.addEventListener(type, callback[, capture=false])
   static JSValue element_addEventListener(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv) {
     dom::Node *node = getNodeFromThis(ctx, this_val);
@@ -1458,12 +1968,15 @@ public:
     if (!JS_IsFunction(ctx, argv[1])) return JS_EXCEPTION;
 
     std::string type = JSBinding::toStdString(ctx, argv[0]);
+    bool capture = argc >= 3 && JS_ToBool(ctx, argv[2]) != 0;
     uint32_t id = EventBinding::addListener(ctx, argv[1]);
-    node->eventListenerIds_[type].push_back(id);
+    node->addEventListener(type, id, capture);
     return JS_UNDEFINED;
   }
 
-  // element.removeEventListener(type, callback)
+  // element.removeEventListener(type, callback[, capture])
+  // std::function identity isn't available across the binding, so the last
+  // matching entry (by capture flag when provided) is removed.
   static JSValue element_removeEventListener(JSContext *ctx, JSValueConst this_val,
                                               int argc, JSValueConst *argv) {
     dom::Node *node = getNodeFromThis(ctx, this_val);
@@ -1471,10 +1984,28 @@ public:
 
     std::string type = JSBinding::toStdString(ctx, argv[0]);
     auto it = node->eventListenerIds_.find(type);
-    if (it != node->eventListenerIds_.end() && !it->second.empty()) {
-      uint32_t id = it->second.back();
+    if (it == node->eventListenerIds_.end() || it->second.empty()) {
+      return JS_UNDEFINED;
+    }
+
+    bool captureSpecified = argc >= 3 && !JS_IsUndefined(argv[2]) &&
+                            !JS_IsNull(argv[2]);
+    bool capture = captureSpecified ? JS_ToBool(ctx, argv[2]) != 0 : false;
+
+    long long removeIdx = -1;
+    for (size_t i = it->second.size(); i-- > 0;) {
+      if (!captureSpecified || it->second[i].capture == capture) {
+        removeIdx = (long long)i;
+        break;
+      }
+    }
+    if (removeIdx >= 0) {
+      uint32_t id = it->second[(size_t)removeIdx].id;
       EventBinding::removeListener(id);
-      it->second.pop_back();
+      it->second.erase(it->second.begin() + removeIdx);
+      if (it->second.empty()) {
+        node->eventListenerIds_.erase(it);
+      }
     }
     return JS_UNDEFINED;
   }
