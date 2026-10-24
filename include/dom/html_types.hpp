@@ -245,9 +245,32 @@ public:
 
   virtual NodePtr cloneNode(bool deep = false) const = 0;
 
-  void appendChild(NodePtr child) {
-    if (!child)
-      return;
+  // DOM pre-insertion validity: a node may not become its own descendant
+  // (that would create a parent cycle and recurse forever in
+  // notifyMutation/textContent). Mutators below return false and leave the
+  // tree untouched in that case.
+  bool isHostIncludingInclusiveDescendantOf(const Node *node) const {
+    if (this == node)
+      return true;
+    for (NodePtr p = parentNode(); p; p = p->parentNode()) {
+      if (p.get() == node)
+        return true;
+    }
+    return false;
+  }
+
+  bool appendChild(NodePtr child) {
+    if (!child || isHostIncludingInclusiveDescendantOf(child.get()))
+      return false;
+
+    if (child->nodeType() == NodeType::DocumentFragment) {
+      // Inserting a fragment inserts (moves) its children
+      const std::vector<NodePtr> children = child->childNodes_;
+      for (const auto &c : children) {
+        appendChild(c);
+      }
+      return true;
+    }
 
     if (auto oldParent = child->parentNode_.lock()) {
       oldParent->removeChild(child);
@@ -265,15 +288,33 @@ public:
     lastChild_ = child;
     childNodes_.push_back(child);
     notifyMutation();
+    return true;
   }
 
-  void insertBefore(NodePtr newChild, NodePtr refChild) {
+  bool insertBefore(NodePtr newChild, NodePtr refChild) {
     if (!newChild)
-      return;
+      return false;
 
     if (!refChild) {
-      appendChild(newChild);
-      return;
+      return appendChild(newChild);
+    }
+
+    if (isHostIncludingInclusiveDescendantOf(newChild.get()))
+      return false;
+
+    // Inserting a node before itself leaves it where it is
+    if (refChild == newChild) {
+      refChild = newChild->nextSibling();
+      if (!refChild)
+        return appendChild(newChild);
+    }
+
+    if (newChild->nodeType() == NodeType::DocumentFragment) {
+      const std::vector<NodePtr> children = newChild->childNodes_;
+      for (const auto &c : children) {
+        insertBefore(c, refChild);
+      }
+      return true;
     }
 
     if (auto oldParent = newChild->parentNode_.lock()) {
@@ -282,8 +323,7 @@ public:
 
     auto it = std::find(childNodes_.begin(), childNodes_.end(), refChild);
     if (it == childNodes_.end()) {
-      appendChild(newChild);
-      return;
+      return appendChild(newChild);
     }
 
     newChild->parentNode_ = weak_from_this();
@@ -300,6 +340,7 @@ public:
 
     childNodes_.insert(it, newChild);
     notifyMutation();
+    return true;
   }
 
   void removeChild(NodePtr child) {
@@ -330,40 +371,23 @@ public:
     notifyMutation();
   }
 
-  void replaceChild(NodePtr newChild, NodePtr oldChild) {
-    if (!newChild || !oldChild)
-      return;
+  bool replaceChild(NodePtr newChild, NodePtr oldChild) {
+    if (!newChild || !oldChild ||
+        std::find(childNodes_.begin(), childNodes_.end(), oldChild) ==
+            childNodes_.end())
+      return false;
+    if (isHostIncludingInclusiveDescendantOf(newChild.get()))
+      return false;
+    if (newChild == oldChild)
+      return true;
 
-    auto it = std::find(childNodes_.begin(), childNodes_.end(), oldChild);
-    if (it == childNodes_.end())
-      return;
-
-    if (auto oldParent = newChild->parentNode_.lock()) {
-      oldParent->removeChild(newChild);
-    }
-
-    newChild->parentNode_ = weak_from_this();
-
-    if (auto prev = oldChild->previousSibling_.lock()) {
-      prev->nextSibling_ = newChild;
-      newChild->previousSibling_ = prev;
-    } else {
-      firstChild_ = newChild;
-    }
-
-    if (auto next = oldChild->nextSibling_.lock()) {
-      next->previousSibling_ = newChild;
-      newChild->nextSibling_ = next;
-    } else {
-      lastChild_ = newChild;
-    }
-
-    oldChild->parentNode_.reset();
-    oldChild->previousSibling_.reset();
-    oldChild->nextSibling_.reset();
-
-    *it = newChild;
-    notifyMutation();
+    // Insert the replacement in front of oldChild, then drop oldChild.
+    // Going through insertBefore/removeChild keeps sibling links valid even
+    // when newChild is currently a sibling of oldChild (removing it first
+    // would invalidate a precomputed position) and expands fragments.
+    insertBefore(newChild, oldChild);
+    removeChild(oldChild);
+    return true;
   }
 
   void normalize() {

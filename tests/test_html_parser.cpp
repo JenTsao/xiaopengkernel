@@ -775,3 +775,123 @@ TEST(HtmlParser_SrcsetAndImportUrls) {
     EXPECT_TRUE(std::find(sheets.begin(), sheets.end(), "x.css") != sheets.end());
     EXPECT_TRUE(std::find(sheets.begin(), sheets.end(), "y.css") != sheets.end());
 }
+
+// ── Regression: tree construction ────────────────────────────
+
+TEST(TreeBuilder_GenericEndTagClosesElement) {
+    // </span> must close the span: "b" is its sibling, not its child
+    auto result = HtmlParser::parseHtml("<p><span>a</span>b</p>");
+    auto spans = result.document->getElementsByTagName("span");
+    ASSERT_EQ(spans.size(), (size_t)1);
+    EXPECT_STREQ(spans[0]->textContent().c_str(), "a");
+    EXPECT_STREQ(firstText(result.document, "p").c_str(), "ab");
+
+    // A stray end tag is ignored instead of popping html/body off the stack
+    auto stray = HtmlParser::parseHtml("<div>a</div></span><p>b</p>");
+    auto body = stray.document->body();
+    ASSERT_TRUE(body != nullptr);
+    EXPECT_EQ(body->getElementsByTagName("p").size(), (size_t)1);
+}
+
+TEST(TreeBuilder_TemplateDoesNotRecurse) {
+    // <template> used to bounce between in-head and after-head forever
+    auto result = HtmlParser::parseHtml(
+        "<body><template><p>x</p></template><p>y</p></body>");
+    auto templates = result.document->getElementsByTagName("template");
+    ASSERT_EQ(templates.size(), (size_t)1);
+    EXPECT_STREQ(templates[0]->textContent().c_str(), "x");
+    auto ps = result.document->getElementsByTagName("p");
+    ASSERT_EQ(ps.size(), (size_t)2);
+    EXPECT_TRUE(ps[1]->parentNode() == result.document->body());
+
+    auto afterHead = HtmlParser::parseHtml(
+        "<head></head><template>t</template><body><p>z</p></body>");
+    ASSERT_TRUE(afterHead.document->body() != nullptr);
+    EXPECT_STREQ(firstText(afterHead.document, "p").c_str(), "z");
+}
+
+TEST(TreeBuilder_HeadPhaseContent) {
+    // noscript in head (scripting off) must not swallow the document
+    auto noscript = HtmlParser::parseHtml(
+        "<head><noscript><link rel=\"stylesheet\" href=\"a.css\"></noscript>"
+        "</head><body><p>Hi</p></body>");
+    EXPECT_STREQ(firstText(noscript.document, "p").c_str(), "Hi");
+    EXPECT_EQ(noscript.document->getElementsByTagName("link").size(), (size_t)1);
+
+    // a script between </head> and <body> must not nest body inside head
+    auto script = HtmlParser::parseHtml(
+        "<head></head><script>x</script><body><p>Hi</p></body>");
+    auto body = script.document->body();
+    ASSERT_TRUE(body != nullptr);
+    EXPECT_TRUE(body->parentNode() == script.document->documentElement());
+
+    // text that starts with whitespace after head content belongs to body
+    auto text = HtmlParser::parseHtml("<title>T</title>\nHello");
+    ASSERT_TRUE(text.document->body() != nullptr);
+    EXPECT_TRUE(text.document->body()->textContent().find("Hello") !=
+                std::string::npos);
+    EXPECT_TRUE(text.document->head()->textContent().find("Hello") ==
+                std::string::npos);
+}
+
+TEST(TreeBuilder_AdoptionAgency) {
+    {
+        // <b>1<i>2</b>3</i> → <b>1<i>2</i></b><i>3</i>
+        auto result = HtmlParser::parseHtml("<p><b>1<i>2</b>3</i></p>");
+        auto bs = result.document->getElementsByTagName("b");
+        auto is = result.document->getElementsByTagName("i");
+        ASSERT_EQ(bs.size(), (size_t)1);
+        ASSERT_EQ(is.size(), (size_t)2);
+        EXPECT_STREQ(bs[0]->textContent().c_str(), "12");
+        EXPECT_STREQ(is[1]->textContent().c_str(), "3");
+        EXPECT_TRUE(is[1]->parentNode() == bs[0]->parentNode());
+    }
+    {
+        // <b>1<p>2</b>3</p> → <b>1</b><p><b>2</b>3</p>
+        auto result = HtmlParser::parseHtml("<b>1<p>2</b>3</p>");
+        auto ps = result.document->getElementsByTagName("p");
+        ASSERT_EQ(ps.size(), (size_t)1);
+        EXPECT_TRUE(ps[0]->parentNode() == result.document->body());
+        EXPECT_STREQ(ps[0]->textContent().c_str(), "23");
+        auto bs = result.document->getElementsByTagName("b");
+        ASSERT_EQ(bs.size(), (size_t)2);
+        EXPECT_STREQ(bs[0]->textContent().c_str(), "1");
+        EXPECT_STREQ(bs[1]->textContent().c_str(), "2");
+        EXPECT_TRUE(bs[1]->parentNode() == ps[0]);
+    }
+    {
+        // <b><span>x</b>y: "y" is outside the bold span
+        auto result = HtmlParser::parseHtml("<div><b><span>x</b>y</div>");
+        EXPECT_STREQ(firstText(result.document, "b").c_str(), "x");
+        EXPECT_STREQ(firstText(result.document, "div").c_str(), "xy");
+    }
+}
+
+TEST(TreeBuilder_TableStructureWithWhitespace) {
+    // whitespace between cells must not open a new tbody/tr per cell
+    auto result = HtmlParser::parseHtml(
+        "<table>\n <tr>\n  <td>a</td>\n  <td>b</td>\n </tr>\n</table>");
+    EXPECT_EQ(result.document->getElementsByTagName("tbody").size(), (size_t)1);
+    EXPECT_EQ(result.document->getElementsByTagName("tr").size(), (size_t)1);
+    EXPECT_EQ(result.document->getElementsByTagName("td").size(), (size_t)2);
+
+    // </select> inside a cell returns to the cell, so the next <td> opens
+    auto select = HtmlParser::parseHtml(
+        "<table><tr><td><select><option>a</select></td><td>b</td></tr></table>");
+    EXPECT_EQ(select.document->getElementsByTagName("td").size(), (size_t)2);
+
+    // text directly inside <table> is foster-parented in front of it
+    auto foster = HtmlParser::parseHtml("<table>oops<tr><td>x</td></tr></table>");
+    auto tables = foster.document->getElementsByTagName("table");
+    ASSERT_EQ(tables.size(), (size_t)1);
+    EXPECT_STREQ(tables[0]->textContent().c_str(), "x");
+    auto before = tables[0]->previousSibling();
+    ASSERT_TRUE(before != nullptr);
+    EXPECT_STREQ(before->textContent().c_str(), "oops");
+}
+
+TEST(TreeBuilder_PlaintextKeepsContent) {
+    auto result = HtmlParser::parseHtml("<p>a</p><plaintext><b>x</b>");
+    EXPECT_STREQ(firstText(result.document, "plaintext").c_str(), "<b>x</b>");
+    EXPECT_EQ(result.document->getElementsByTagName("b").size(), (size_t)0);
+}

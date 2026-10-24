@@ -1724,6 +1724,15 @@ public:
     return JS_UNDEFINED;
   }
 
+  // Throw an Error whose name is a DOMException name (HierarchyRequestError…)
+  static JSValue throwDomException(JSContext *ctx, const char *name,
+                                   const char *message) {
+    JSValue err = JS_NewError(ctx);
+    JS_SetPropertyStr(ctx, err, "name", JS_NewString(ctx, name));
+    JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, message));
+    return JS_Throw(ctx, err);
+  }
+
   // element.appendChild(child) — accepts Element, Text and DocumentFragment
   static JSValue element_appendChild(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv) {
@@ -1735,7 +1744,9 @@ public:
       JS_ThrowTypeError(ctx, "Argument is not a Node");
       return JS_EXCEPTION;
     }
-    parent->appendChild(child);
+    if (!parent->appendChild(child))
+      return throwDomException(ctx, "HierarchyRequestError",
+                               "The new child is an ancestor of the parent");
     return JS_DupValue(ctx, argv[0]);
   }
 
@@ -1779,7 +1790,9 @@ public:
       }
     }
 
-    parent->insertBefore(newNode, refNode);
+    if (!parent->insertBefore(newNode, refNode))
+      return throwDomException(ctx, "HierarchyRequestError",
+                               "The new child is an ancestor of the parent");
     return JS_DupValue(ctx, argv[0]);
   }
 
@@ -1803,7 +1816,13 @@ public:
       return JS_EXCEPTION;
     }
 
-    parent->replaceChild(newChild, oldChild);
+    if (!parent->replaceChild(newChild, oldChild)) {
+      if (oldChild->parentNode().get() != parent)
+        return throwDomException(ctx, "NotFoundError",
+                                 "The old child is not a child of this node");
+      return throwDomException(ctx, "HierarchyRequestError",
+                               "The new child is an ancestor of the parent");
+    }
     return JS_DupValue(ctx, argv[1]);
   }
 
@@ -1853,45 +1872,21 @@ public:
   }
 
   // ── NEW: element.isEqualNode(otherNode) ──
+  // Comment and fragment wrappers share the element class id, so work on
+  // dom::Node and let Node::isEqualNode compare type, content and children
   static JSValue element_isEqualNode(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv) {
-    (void)ctx;
-    dom::Element *el = (dom::Element *)JS_GetOpaque(this_val, s_elementClassId);
-    if (!el || argc < 1) return JS_EXCEPTION;
-
-    dom::Element *other = (dom::Element *)JS_GetOpaque(argv[0], s_elementClassId);
-    if (!other) return JS_FALSE;
-
-    // Compare tag name
-    if (el->localName() != other->localName()) return JS_FALSE;
-
-    // Compare attributes
-    auto &attrs1 = el->attributes();
-    auto &attrs2 = other->attributes();
-    if (attrs1.size() != attrs2.size()) return JS_FALSE;
-    for (const auto &a : attrs1) {
-      auto v = other->getAttribute(a.name);
-      if (!v.has_value() || v.value() != a.value) return JS_FALSE;
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node) {
+      JS_ThrowTypeError(ctx, "Invalid node");
+      return JS_EXCEPTION;
     }
-
-    // Compare child count
-    auto &c1 = el->childNodes();
-    auto &c2 = other->childNodes();
-    if (c1.size() != c2.size()) return JS_FALSE;
-
-    // Recursively compare children
-    for (size_t i = 0; i < c1.size(); ++i) {
-      if (c1[i]->nodeType() != c2[i]->nodeType()) return JS_FALSE;
-      if (c1[i]->nodeType() == dom::NodeType::Element) {
-        // Recursive check via isEqualNode
-        auto e1 = std::static_pointer_cast<dom::Element>(c1[i]);
-        auto e2 = std::static_pointer_cast<dom::Element>(c2[i]);
-        if (e1->localName() != e2->localName()) return JS_FALSE;
-      } else if (c1[i]->textContent() != c2[i]->textContent()) {
-        return JS_FALSE;
-      }
-    }
-    return JS_TRUE;
+    if (argc < 1)
+      return JS_FALSE;
+    dom::NodePtr other = getNodeArg(ctx, argv[0]);
+    if (!other)
+      return JS_FALSE;
+    return JS_NewBool(ctx, node->isEqualNode(other));
   }
 
   // element.matches(selector)

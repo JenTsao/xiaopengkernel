@@ -211,8 +211,14 @@ inline void Element::insertAdjacentHTML(const std::string &position,
     }
   }
   auto nodes = HtmlParser::parseFragment(html, parseContext);
-  for (const auto &node : nodes) {
-    detail::insertAdjacentNodeAt(this, position, node);
+  if (nodes.empty() || !detail::insertAdjacentNodeAt(this, position, nodes[0]))
+    return;
+  // The rest follow the first node. Re-reading firstChild/nextSibling for
+  // every node would insert them in reverse order.
+  auto parent = nodes[0]->parentNode();
+  auto ref = nodes[0]->nextSibling();
+  for (size_t i = 1; i < nodes.size(); ++i) {
+    parent->insertBefore(nodes[i], ref);
   }
 }
 

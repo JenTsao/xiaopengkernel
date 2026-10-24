@@ -245,9 +245,8 @@ public:
   }
 
   void setTextContent(const std::string &text) override {
-    childNodes_.clear();
-    firstChild_.reset();
-    lastChild_.reset();
+    // Node::removeAllChildren detaches each child (parent/sibling links)
+    removeAllChildren();
     if (!text.empty()) {
       appendChild(std::make_shared<TextNode>(text));
     }
@@ -259,12 +258,6 @@ public:
       result += child->toHtml();
     }
     return result;
-  }
-
-  void removeAllChildren() {
-    childNodes_.clear();
-    firstChild_.reset();
-    lastChild_.reset();
   }
 
   std::string outerHTML() const { return toHtml(); }

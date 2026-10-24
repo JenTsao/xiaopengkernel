@@ -98,6 +98,14 @@ private:
   void processInSelectInTableInsertionMode(const Token &token);
   void processAfterBodyInsertionMode(const Token &token);
   void processAfterAfterBodyInsertionMode(const Token &token);
+  void processInHeadNoscriptInsertionMode(const Token &token);
+
+  bool splitLeadingWhitespace(const Token &token, bool insertWhitespace);
+  NodePtr appropriateInsertionParent(NodePtr &before);
+  void closeTemplateElement(const Token &token);
+  void resetInsertionModeAppropriately();
+  bool runAdoptionAgency(const Token &token);
+  void closeElementForEndTag(const Token &token);
 
   void insertDoctype(const Token &token);
   void insertComment(const Token &token);
@@ -142,6 +150,7 @@ private:
   void reconstructActiveFormattingElements();
   void pushActiveFormattingElements(const ElementPtr &element);
   void clearActiveFormattingElements();
+  void clearStackBackTo(std::initializer_list<const char *> names);
 
   void acknowledgeSelfClosingFlag();
 
@@ -159,6 +168,7 @@ private:
   }
 
   std::string pendingTableCharacterTokens_;
+  InsertionMode tableTextReturnMode_ = InsertionMode::InTable;
 
   static bool isSpecialTagName(const std::string &tagName);
   static bool isFormattingTagName(const std::string &tagName);
@@ -345,6 +355,9 @@ inline void HtmlTreeBuilder::processUsingRulesFor(InsertionMode mode,
   case InsertionMode::InHead:
     processInHeadInsertionMode(token);
     break;
+  case InsertionMode::InHeadNoscript:
+    processInHeadNoscriptInsertionMode(token);
+    break;
   case InsertionMode::AfterHead:
     processAfterHeadInsertionMode(token);
     break;
@@ -399,7 +412,7 @@ inline void HtmlTreeBuilder::processInitialInsertionMode(const Token &token) {
     return;
   }
 
-  if (token.isCharacter() && isWhitespace(token.data[0])) {
+  if (token.isCharacter() && splitLeadingWhitespace(token, false)) {
     return;
   }
 
@@ -433,7 +446,7 @@ HtmlTreeBuilder::processBeforeHtmlInsertionMode(const Token &token) {
     return;
   }
 
-  if (token.isCharacter() && isWhitespace(token.data[0])) {
+  if (token.isCharacter() && splitLeadingWhitespace(token, false)) {
     return;
   }
 
@@ -459,8 +472,7 @@ HtmlTreeBuilder::processBeforeHtmlInsertionMode(const Token &token) {
 
 inline void
 HtmlTreeBuilder::processBeforeHeadInsertionMode(const Token &token) {
-  if (token.isCharacter() && isWhitespace(token.data[0])) {
-    insertCharacter(token);
+  if (token.isCharacter() && splitLeadingWhitespace(token, true)) {
     return;
   }
 
@@ -505,8 +517,7 @@ HtmlTreeBuilder::processBeforeHeadInsertionMode(const Token &token) {
 }
 
 inline void HtmlTreeBuilder::processInHeadInsertionMode(const Token &token) {
-  if (token.isCharacter() && isWhitespace(token.data[0])) {
-    insertCharacter(token);
+  if (token.isCharacter() && splitLeadingWhitespace(token, true)) {
     return;
   }
 
@@ -568,6 +579,16 @@ inline void HtmlTreeBuilder::processInHeadInsertionMode(const Token &token) {
       return;
     }
 
+    if (tagName == "template") {
+      insertElement(token);
+      activeFormattingElements_.push_back(nullptr); // marker
+      pushTemplateStack(currentElement());
+      framesetOk_ = false;
+      // Contents are parsed with the in-body rules as the template's children
+      insertionMode_ = InsertionMode::InBody;
+      return;
+    }
+
     if (tagName == "head") {
       emitError("Unexpected head start tag", token);
       return;
@@ -580,6 +601,11 @@ inline void HtmlTreeBuilder::processInHeadInsertionMode(const Token &token) {
     if (tagName == "head") {
       popStack();
       insertionMode_ = InsertionMode::AfterHead;
+      return;
+    }
+
+    if (tagName == "template") {
+      closeTemplateElement(token);
       return;
     }
 
@@ -597,8 +623,7 @@ inline void HtmlTreeBuilder::processInHeadInsertionMode(const Token &token) {
 }
 
 inline void HtmlTreeBuilder::processAfterHeadInsertionMode(const Token &token) {
-  if (token.isCharacter() && isWhitespace(token.data[0])) {
-    insertCharacter(token);
+  if (token.isCharacter() && splitLeadingWhitespace(token, true)) {
     return;
   }
 
@@ -643,8 +668,14 @@ inline void HtmlTreeBuilder::processAfterHeadInsertionMode(const Token &token) {
       }
       pushStack(headElement_, Token::makeStartTag("head"));
       processInHeadInsertionMode(token);
-      if (!stack_.empty() && stack_.back().element == headElement_) {
-        popStack();
+      // Remove head wherever it is: after <script>/<title>/<template> the
+      // current node is that element, not head, and leaving head open would
+      // nest the body inside it
+      for (auto it = stack_.begin(); it != stack_.end(); ++it) {
+        if (it->element == headElement_) {
+          stack_.erase(it);
+          break;
+        }
       }
       return;
     }
@@ -873,7 +904,8 @@ inline void HtmlTreeBuilder::processInBodyInsertionMode(const Token &token) {
         processInBodyInsertionMode(endP);
       }
       insertElement(token);
-      insertionMode_ = InsertionMode::Plaintext;
+      // The tokenizer switched to the PLAINTEXT state; the remaining input
+      // arrives as character tokens handled by the in-body rules
       return;
     }
 
@@ -1076,6 +1108,11 @@ inline void HtmlTreeBuilder::processInBodyInsertionMode(const Token &token) {
   if (token.isEndTag()) {
     std::string tagName = toLower(token.name);
 
+    if (tagName == "template") {
+      processInHeadInsertionMode(token);
+      return;
+    }
+
     if (tagName == "body") {
       if (!hasElementInScope("body")) {
         emitError("Unexpected body end tag", token);
@@ -1217,35 +1254,9 @@ inline void HtmlTreeBuilder::processInBodyInsertionMode(const Token &token) {
         "a",    "b", "big",   "code",   "em",     "font", "i",
         "nobr", "s", "small", "strike", "strong", "tt",   "u"};
     if (formattingEndTags.find(tagName) != formattingEndTags.end()) {
-      for (int i = static_cast<int>(activeFormattingElements_.size()) - 1;
-           i >= 0; --i) {
-        auto elem = activeFormattingElements_[i];
-        if (!elem)
-          continue;
-
-        if (toLower(elem->localName()) == tagName) {
-          if (!hasElementInScope(tagName)) {
-            emitError("Unexpected end tag", token);
-            return;
-          }
-
-          if (currentElement() != elem) {
-            emitError("End tag mismatch", token);
-          }
-
-          for (auto it = stack_.rbegin(); it != stack_.rend(); ++it) {
-            if (it->element == elem) {
-              stack_.erase(std::next(it).base());
-              break;
-            }
-          }
-
-          activeFormattingElements_.erase(activeFormattingElements_.begin() +
-                                          i);
-          return;
-        }
+      if (!runAdoptionAgency(token)) {
+        closeElementForEndTag(token);
       }
-      emitError("No matching start tag", token);
       return;
     }
 
@@ -1256,11 +1267,7 @@ inline void HtmlTreeBuilder::processInBodyInsertionMode(const Token &token) {
       return;
     }
 
-    generateImpliedEndTags();
-    if (currentElement() && toLower(currentElement()->localName()) != tagName) {
-      emitError("End tag mismatch", token);
-    }
-    openElementsTo(tagName);
+    closeElementForEndTag(token);
     return;
   }
 
@@ -1302,6 +1309,12 @@ inline void HtmlTreeBuilder::processTextInsertionMode(const Token &token) {
 
 inline void HtmlTreeBuilder::processInTableInsertionMode(const Token &token) {
   if (token.isCharacter()) {
+    // Remember where we came from (in row / in table body / in table) so
+    // the flush returns there; always resuming "in table" would turn the
+    // whitespace between <tr> and <td> into a nested tbody per cell
+    if (insertionMode_ != InsertionMode::InTableText) {
+      tableTextReturnMode_ = insertionMode_;
+    }
     pendingTableCharacterTokens_ += token.data;
     insertionMode_ = InsertionMode::InTableText;
     return;
@@ -1321,21 +1334,22 @@ inline void HtmlTreeBuilder::processInTableInsertionMode(const Token &token) {
     std::string tagName = toLower(token.name);
 
     if (tagName == "caption") {
-      clearActiveFormattingElements();
+      clearStackBackTo({"table"});
+      activeFormattingElements_.push_back(nullptr); // marker
       insertElement(token);
       insertionMode_ = InsertionMode::InCaption;
       return;
     }
 
     if (tagName == "colgroup") {
-      clearActiveFormattingElements();
+      clearStackBackTo({"table"});
       insertElement(token);
       insertionMode_ = InsertionMode::InColumnGroup;
       return;
     }
 
     if (tagName == "col") {
-      clearActiveFormattingElements();
+      clearStackBackTo({"table"});
       insertElement(Token::makeStartTag("colgroup"));
       insertionMode_ = InsertionMode::InColumnGroup;
       processToken(token);
@@ -1343,14 +1357,14 @@ inline void HtmlTreeBuilder::processInTableInsertionMode(const Token &token) {
     }
 
     if (tagName == "tbody" || tagName == "tfoot" || tagName == "thead") {
-      clearActiveFormattingElements();
+      clearStackBackTo({"table"});
       insertElement(token);
       insertionMode_ = InsertionMode::InTableBody;
       return;
     }
 
     if (tagName == "td" || tagName == "th" || tagName == "tr") {
-      clearActiveFormattingElements();
+      clearStackBackTo({"table"});
       insertElement(Token::makeStartTag("tbody"));
       insertionMode_ = InsertionMode::InTableBody;
       processToken(token);
@@ -1398,7 +1412,7 @@ inline void HtmlTreeBuilder::processInTableInsertionMode(const Token &token) {
       }
       openElementsTo("table");
       popStack();
-      insertionMode_ = InsertionMode::AfterBody;
+      resetInsertionModeAppropriately();
       return;
     }
 
@@ -1455,7 +1469,7 @@ HtmlTreeBuilder::processInTableTextInsertionMode(const Token &token) {
     pendingTableCharacterTokens_.clear();
   }
 
-  insertionMode_ = InsertionMode::InTable;
+  insertionMode_ = tableTextReturnMode_;
   processToken(token);
 }
 
@@ -1507,8 +1521,7 @@ inline void HtmlTreeBuilder::processInCaptionInsertionMode(const Token &token) {
 
 inline void
 HtmlTreeBuilder::processInColumnGroupInsertionMode(const Token &token) {
-  if (token.isCharacter() && isWhitespace(token.data[0])) {
-    insertCharacter(token);
+  if (token.isCharacter() && splitLeadingWhitespace(token, true)) {
     return;
   }
 
@@ -1568,7 +1581,7 @@ HtmlTreeBuilder::processInColumnGroupInsertionMode(const Token &token) {
 inline void
 HtmlTreeBuilder::processInTableBodyInsertionMode(const Token &token) {
   if (token.isStartTag() && toLower(token.name) == "tr") {
-    clearActiveFormattingElements();
+    clearStackBackTo({"tbody", "tfoot", "thead"});
     insertElement(token);
     insertionMode_ = InsertionMode::InRow;
     return;
@@ -1577,7 +1590,7 @@ HtmlTreeBuilder::processInTableBodyInsertionMode(const Token &token) {
   if (token.isStartTag() &&
       (toLower(token.name) == "td" || toLower(token.name) == "th")) {
     emitError("Unexpected td/th start tag", token);
-    clearActiveFormattingElements();
+    clearStackBackTo({"tbody", "tfoot", "thead"});
     insertElement(Token::makeStartTag("tr"));
     insertionMode_ = InsertionMode::InRow;
     processToken(token);
@@ -1591,8 +1604,7 @@ HtmlTreeBuilder::processInTableBodyInsertionMode(const Token &token) {
       emitError("Unexpected end tag", token);
       return;
     }
-    clearActiveFormattingElements();
-    openElementsTo(token.name);
+    clearStackBackTo({"tbody", "tfoot", "thead"});
     popStack();
     insertionMode_ = InsertionMode::InTable;
     return;
@@ -1637,8 +1649,9 @@ HtmlTreeBuilder::processInTableBodyInsertionMode(const Token &token) {
 inline void HtmlTreeBuilder::processInRowInsertionMode(const Token &token) {
   if (token.isStartTag() &&
       (toLower(token.name) == "td" || toLower(token.name) == "th")) {
-    clearActiveFormattingElements();
+    clearStackBackTo({"tr"});
     insertElement(token);
+    activeFormattingElements_.push_back(nullptr); // marker
     insertionMode_ = InsertionMode::InCell;
     return;
   }
@@ -1648,8 +1661,7 @@ inline void HtmlTreeBuilder::processInRowInsertionMode(const Token &token) {
       emitError("Unexpected tr end tag", token);
       return;
     }
-    clearActiveFormattingElements();
-    openElementsTo("tr");
+    clearStackBackTo({"tr"});
     popStack();
     insertionMode_ = InsertionMode::InTableBody;
     return;
@@ -1872,7 +1884,7 @@ inline void HtmlTreeBuilder::processInSelectInsertionMode(const Token &token) {
       }
       openElementsTo("select");
       popStack();
-      insertionMode_ = InsertionMode::InBody;
+      resetInsertionModeAppropriately();
       return;
     }
 
@@ -1978,6 +1990,351 @@ HtmlTreeBuilder::processAfterAfterBodyInsertionMode(const Token &token) {
   processToken(token);
 }
 
+// A character token carries a whole text run ("\n  Hello"), but the
+// head-phase modes treat whitespace and other characters differently.
+// Handle the leading whitespace here and reprocess the rest in the current
+// mode; returns false if the run does not start with whitespace.
+inline bool HtmlTreeBuilder::splitLeadingWhitespace(const Token &token,
+                                                    bool insertWhitespace) {
+  size_t n = 0;
+  while (n < token.data.size() && isWhitespace(token.data[n])) {
+    n++;
+  }
+  if (n == 0) {
+    return false;
+  }
+  if (insertWhitespace) {
+    insertTextNode(token.data.substr(0, n));
+  }
+  if (n < token.data.size()) {
+    processToken(Token::makeCharacter(token.data.substr(n)));
+  }
+  return true;
+}
+
+// "in head noscript" (scripting disabled): only head content is allowed
+inline void
+HtmlTreeBuilder::processInHeadNoscriptInsertionMode(const Token &token) {
+  if (token.isDoctype()) {
+    emitError("Unexpected doctype", token);
+    return;
+  }
+
+  if (token.isStartTag() && toLower(token.name) == "html") {
+    processInBodyInsertionMode(token);
+    return;
+  }
+
+  if (token.isEndTag() && toLower(token.name) == "noscript") {
+    popStack();
+    insertionMode_ = InsertionMode::InHead;
+    return;
+  }
+
+  if (token.isComment() ||
+      (token.isCharacter() && !token.data.empty() &&
+       isWhitespace(token.data[0]))) {
+    if (token.isCharacter() && splitLeadingWhitespace(token, true)) {
+      return;
+    }
+    processInHeadInsertionMode(token);
+    return;
+  }
+
+  if (token.isStartTag()) {
+    std::string tagName = toLower(token.name);
+    if (tagName == "basefont" || tagName == "bgsound" || tagName == "link" ||
+        tagName == "meta" || tagName == "noframes" || tagName == "style") {
+      processInHeadInsertionMode(token);
+      return;
+    }
+    if (tagName == "head" || tagName == "noscript") {
+      emitError("Unexpected start tag in noscript", token);
+      return;
+    }
+  }
+
+  if (token.isEndTag() && toLower(token.name) != "br") {
+    emitError("Unexpected end tag in noscript", token);
+    return;
+  }
+
+  // Anything else closes the noscript element and is reprocessed in head
+  emitError("Unexpected token in noscript", token);
+  popStack();
+  insertionMode_ = InsertionMode::InHead;
+  processToken(token);
+}
+
+// </template>. Template contents are parsed with the in-body rules and kept
+// as the template element's children (there is no "in template" mode).
+inline void HtmlTreeBuilder::closeTemplateElement(const Token &token) {
+  if (!inTemplateStack()) {
+    emitError("Unexpected template end tag", token);
+    return;
+  }
+  ElementPtr tmpl = templateStack_.back();
+  popTemplateStack();
+
+  bool open = false;
+  for (const auto &item : stack_) {
+    if (item.element == tmpl) {
+      open = true;
+      break;
+    }
+  }
+  if (!open) {
+    return;
+  }
+
+  generateAllImpliedEndTags();
+  if (currentElement() != tmpl) {
+    emitError("End tag mismatch", token);
+  }
+  while (!stack_.empty()) {
+    bool done = currentElement() == tmpl;
+    popStack();
+    if (done) {
+      break;
+    }
+  }
+  clearActiveFormattingElements();
+  resetInsertionModeAppropriately();
+}
+
+// WHATWG "reset the insertion mode appropriately"
+inline void HtmlTreeBuilder::resetInsertionModeAppropriately() {
+  for (size_t i = stack_.size(); i-- > 0;) {
+    const bool last = i == 0;
+    const std::string name = toLower(stack_[i].element->localName());
+    if (name == "select") {
+      insertionMode_ = InsertionMode::InSelect;
+      for (size_t j = i; j-- > 0;) {
+        if (toLower(stack_[j].element->localName()) == "table") {
+          insertionMode_ = InsertionMode::InSelectInTable;
+          break;
+        }
+      }
+      return;
+    }
+    if ((name == "td" || name == "th") && !last) {
+      insertionMode_ = InsertionMode::InCell;
+      return;
+    }
+    if (name == "tr") {
+      insertionMode_ = InsertionMode::InRow;
+      return;
+    }
+    if (name == "tbody" || name == "thead" || name == "tfoot") {
+      insertionMode_ = InsertionMode::InTableBody;
+      return;
+    }
+    if (name == "caption") {
+      insertionMode_ = InsertionMode::InCaption;
+      return;
+    }
+    if (name == "colgroup") {
+      insertionMode_ = InsertionMode::InColumnGroup;
+      return;
+    }
+    if (name == "table") {
+      insertionMode_ = InsertionMode::InTable;
+      return;
+    }
+    if (name == "template") {
+      insertionMode_ = InsertionMode::InBody;
+      return;
+    }
+    if (name == "head" && !last) {
+      insertionMode_ = InsertionMode::InHead;
+      return;
+    }
+    if (name == "body") {
+      insertionMode_ = InsertionMode::InBody;
+      return;
+    }
+    if (name == "html") {
+      insertionMode_ = headElement_ ? InsertionMode::AfterHead
+                                    : InsertionMode::BeforeHead;
+      return;
+    }
+    if (last) {
+      insertionMode_ = InsertionMode::InBody;
+      return;
+    }
+  }
+  insertionMode_ = InsertionMode::InBody;
+}
+
+// WHATWG "adoption agency algorithm" for formatting end tags (</b>, </a>…).
+// Misnested markup such as <b>1<p>2</b>3</p> is repaired by re-parenting
+// instead of leaving the formatting element's open children in place.
+// Returns false when the caller must act as for "any other end tag".
+inline bool HtmlTreeBuilder::runAdoptionAgency(const Token &token) {
+  const std::string subject = toLower(token.name);
+  auto stackIndexOf = [this](const ElementPtr &el) {
+    for (size_t i = stack_.size(); i-- > 0;) {
+      if (stack_[i].element == el)
+        return static_cast<int>(i);
+    }
+    return -1;
+  };
+  auto listIndexOf = [this](const ElementPtr &el) {
+    for (size_t i = activeFormattingElements_.size(); i-- > 0;) {
+      if (activeFormattingElements_[i] == el)
+        return static_cast<int>(i);
+    }
+    return -1;
+  };
+
+  ElementPtr current = currentElement();
+  if (current && toLower(current->localName()) == subject &&
+      listIndexOf(current) < 0) {
+    popStack();
+    return true;
+  }
+
+  for (int outer = 0; outer < 8; ++outer) {
+    // Last formatting element with this name after the last marker
+    ElementPtr formatting;
+    int listIndex = -1;
+    for (size_t i = activeFormattingElements_.size(); i-- > 0;) {
+      const ElementPtr &entry = activeFormattingElements_[i];
+      if (!entry)
+        break;
+      if (toLower(entry->localName()) == subject) {
+        formatting = entry;
+        listIndex = static_cast<int>(i);
+        break;
+      }
+    }
+    if (!formatting)
+      return outer > 0;
+
+    int stackIndex = stackIndexOf(formatting);
+    if (stackIndex < 0) {
+      emitError("Formatting element is not open", token);
+      activeFormattingElements_.erase(activeFormattingElements_.begin() +
+                                      listIndex);
+      return true;
+    }
+    if (!hasElementInScope(subject)) {
+      emitError("Formatting element not in scope", token);
+      return true;
+    }
+    if (formatting != currentElement()) {
+      emitError("End tag mismatch", token);
+    }
+
+    // Furthest block: the first special element below the formatting element
+    int furthestIndex = -1;
+    for (size_t i = static_cast<size_t>(stackIndex) + 1; i < stack_.size();
+         ++i) {
+      if (isSpecialElement(stack_[i].element)) {
+        furthestIndex = static_cast<int>(i);
+        break;
+      }
+    }
+    if (furthestIndex < 0) {
+      stack_.erase(stack_.begin() + stackIndex, stack_.end());
+      activeFormattingElements_.erase(activeFormattingElements_.begin() +
+                                      listIndex);
+      return true;
+    }
+    if (stackIndex == 0) {
+      return true;
+    }
+
+    ElementPtr furthestBlock = stack_[furthestIndex].element;
+    ElementPtr commonAncestor = stack_[stackIndex - 1].element;
+    int bookmark = listIndex;
+
+    ElementPtr lastNode = furthestBlock;
+    int nodeIndex = furthestIndex;
+    for (int inner = 1;; ++inner) {
+      nodeIndex--;
+      ElementPtr node = stack_[nodeIndex].element;
+      if (node == formatting)
+        break;
+      int nodeListIndex = listIndexOf(node);
+      if (inner > 3 && nodeListIndex >= 0) {
+        activeFormattingElements_.erase(activeFormattingElements_.begin() +
+                                        nodeListIndex);
+        if (nodeListIndex < bookmark)
+          bookmark--;
+        nodeListIndex = -1;
+      }
+      if (nodeListIndex < 0) {
+        stack_.erase(stack_.begin() + nodeIndex);
+        continue;
+      }
+      auto clone = std::static_pointer_cast<Element>(node->cloneNode(false));
+      activeFormattingElements_[nodeListIndex] = clone;
+      stack_[nodeIndex] = StackItem(clone, stack_[nodeIndex].token);
+      if (lastNode == furthestBlock)
+        bookmark = nodeListIndex + 1;
+      clone->appendChild(lastNode);
+      lastNode = clone;
+    }
+
+    commonAncestor->appendChild(lastNode);
+
+    auto replacement =
+        std::static_pointer_cast<Element>(formatting->cloneNode(false));
+    const std::vector<NodePtr> children = furthestBlock->childNodes();
+    for (const auto &child : children) {
+      replacement->appendChild(child);
+    }
+    furthestBlock->appendChild(replacement);
+
+    int formattingListIndex = listIndexOf(formatting);
+    if (formattingListIndex >= 0) {
+      activeFormattingElements_.erase(activeFormattingElements_.begin() +
+                                      formattingListIndex);
+      if (formattingListIndex < bookmark)
+        bookmark--;
+    }
+    bookmark = std::max(0, std::min(bookmark, static_cast<int>(
+                                                  activeFormattingElements_.size())));
+    activeFormattingElements_.insert(activeFormattingElements_.begin() + bookmark,
+                                     replacement);
+
+    Token formattingToken = stack_[stackIndexOf(formatting)].token;
+    stack_.erase(stack_.begin() + stackIndexOf(formatting));
+    stack_.insert(stack_.begin() + stackIndexOf(furthestBlock) + 1,
+                  StackItem(replacement, formattingToken));
+  }
+  return true;
+}
+
+// "Any other end tag" in body: close the nearest open element with this name
+// (and everything opened inside it), unless a special element such as div or
+// p sits in between — then the end tag is ignored. Never pops past that.
+inline void HtmlTreeBuilder::closeElementForEndTag(const Token &token) {
+  const std::string tagName = toLower(token.name);
+  for (size_t i = stack_.size(); i-- > 0;) {
+    ElementPtr node = stack_[i].element;
+    if (toLower(node->localName()) == tagName) {
+      generateImpliedEndTags(tagName);
+      if (currentElement() != node) {
+        emitError("End tag mismatch", token);
+      }
+      while (!stack_.empty()) {
+        bool done = currentElement() == node;
+        popStack();
+        if (done) {
+          break;
+        }
+      }
+      return;
+    }
+    if (isSpecialElement(node)) {
+      emitError("Unexpected end tag", token);
+      return;
+    }
+  }
+}
+
 inline void HtmlTreeBuilder::insertDoctype(const Token &token) {
   auto doctype = std::make_shared<DocumentTypeNode>(
       token.name.empty() ? "html" : token.name, token.publicIdentifier,
@@ -2018,10 +2375,40 @@ inline void HtmlTreeBuilder::insertElement(const Token &token) {
   if (stack_.empty()) {
     document_->appendChild(element);
   } else {
-    currentElement()->appendChild(element);
+    NodePtr before;
+    NodePtr parent = appropriateInsertionParent(before);
+    parent->insertBefore(element, before);
   }
 
   pushStack(element, token);
+}
+
+// WHATWG "appropriate place for inserting a node": the current node, except
+// that with foster parenting enabled content met directly inside table
+// markup goes in front of the last open <table> ("before" receives the
+// node to insert before, null meaning append).
+inline NodePtr HtmlTreeBuilder::appropriateInsertionParent(NodePtr &before) {
+  before.reset();
+  ElementPtr current = currentElement();
+  if (fosterParenting_ && current) {
+    const std::string name = toLower(current->localName());
+    if (name == "table" || name == "tbody" || name == "tfoot" ||
+        name == "thead" || name == "tr") {
+      for (size_t i = stack_.size(); i-- > 0;) {
+        if (toLower(stack_[i].element->localName()) != "table")
+          continue;
+        ElementPtr table = stack_[i].element;
+        if (NodePtr tableParent = table->parentNode()) {
+          before = table;
+          return tableParent;
+        }
+        if (i > 0)
+          return stack_[i - 1].element;
+        break;
+      }
+    }
+  }
+  return current;
 }
 
 inline void HtmlTreeBuilder::insertElement(const std::string &tagName) {
@@ -2041,20 +2428,29 @@ inline void HtmlTreeBuilder::insertTextNode(const std::string &data) {
   if (data.empty())
     return;
 
-  NodePtr current = currentElement();
-  if (!current && stack_.empty()) {
-    current = document_;
+  if (stack_.empty()) {
+    auto lastChild = document_->lastChild();
+    if (lastChild && lastChild->nodeType() == NodeType::Text) {
+      auto textNode = std::static_pointer_cast<TextNode>(lastChild);
+      textNode->setData(textNode->data() + data);
+    } else {
+      document_->appendChild(std::make_shared<TextNode>(data));
+    }
+    return;
   }
 
-  if (!current)
+  NodePtr before;
+  NodePtr parent = appropriateInsertionParent(before);
+  if (!parent)
     return;
 
-  auto lastChild = current->lastChild();
-  if (lastChild && lastChild->nodeType() == NodeType::Text) {
-    auto textNode = std::static_pointer_cast<TextNode>(lastChild);
+  // Merge with the text node right in front of the insertion point
+  NodePtr adjacent = before ? before->previousSibling() : parent->lastChild();
+  if (adjacent && adjacent->nodeType() == NodeType::Text) {
+    auto textNode = std::static_pointer_cast<TextNode>(adjacent);
     textNode->setData(textNode->data() + data);
   } else {
-    current->appendChild(std::make_shared<TextNode>(data));
+    parent->insertBefore(std::make_shared<TextNode>(data), before);
   }
 }
 
@@ -2298,8 +2694,11 @@ inline void HtmlTreeBuilder::reconstructActiveFormattingElements() {
   while (index > 0) {
     index--;
     auto entry = activeFormattingElements_[index];
-    if (!entry)
+    if (!entry) {
+      // A marker: reconstruct from the entry after it
+      index++;
       break;
+    }
 
     bool found = false;
     for (const auto &item : stack_) {
@@ -2352,23 +2751,29 @@ HtmlTreeBuilder::pushActiveFormattingElements(const ElementPtr &element) {
   activeFormattingElements_.push_back(element);
 }
 
+// "Clear the list of active formatting elements up to the last marker"
 inline void HtmlTreeBuilder::clearActiveFormattingElements() {
   while (!activeFormattingElements_.empty()) {
     auto last = activeFormattingElements_.back();
     activeFormattingElements_.pop_back();
-
     if (!last)
       break;
+  }
+}
 
-    bool inStack = false;
-    for (const auto &item : stack_) {
-      if (item.element == last) {
-        inStack = true;
-        break;
-      }
+// "Clear the stack back to a table / table body / table row context": pop
+// until the current node is one of names (or html/template)
+inline void
+HtmlTreeBuilder::clearStackBackTo(std::initializer_list<const char *> names) {
+  while (!stack_.empty()) {
+    const std::string name = toLower(currentElement()->localName());
+    if (name == "html" || name == "template")
+      return;
+    for (const char *n : names) {
+      if (name == n)
+        return;
     }
-    if (inStack)
-      break;
+    popStack();
   }
 }
 

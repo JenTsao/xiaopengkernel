@@ -557,6 +557,143 @@ TEST(Event_PhaseFilteringEndToEnd) {
   EventSystem::setEventDispatchCallback(nullptr);
 }
 
+// ── Regression: tree mutation invariants ─────────────────────
+
+namespace {
+
+std::vector<NodePtr> kids(const NodePtr &parent) {
+  return parent->childNodes();
+}
+
+} // namespace
+
+TEST(Mutation_RejectsHierarchyCycles) {
+  auto doc = std::make_shared<Document>();
+  auto parent = makeEl(doc, "div");
+  auto child = makeEl(doc, "span");
+  doc->appendChild(parent);
+  EXPECT_TRUE(parent->appendChild(child));
+
+  // a node cannot become its own child or its ancestor's child
+  EXPECT_FALSE(parent->appendChild(parent));
+  EXPECT_FALSE(child->appendChild(parent));
+  EXPECT_FALSE(child->insertBefore(doc->documentElement(), nullptr));
+  EXPECT_TRUE(child->parentNode() == parent);
+  EXPECT_TRUE(parent->parentNode() == doc);
+  EXPECT_EQ(child->childNodes().size(), (size_t)0);
+  // would recurse forever with a parent cycle
+  EXPECT_STREQ(parent->textContent().c_str(), "");
+}
+
+TEST(Mutation_ReplaceChildWithSibling) {
+  auto doc = std::make_shared<Document>();
+  auto ul = makeEl(doc, "ul");
+  auto a = makeEl(doc, "li", "a");
+  auto b = makeEl(doc, "li", "b");
+  ul->appendChild(a);
+  ul->appendChild(b);
+
+  // replacing b with its earlier sibling a
+  EXPECT_TRUE(ul->replaceChild(a, b));
+  ASSERT_EQ(kids(ul).size(), (size_t)1);
+  EXPECT_TRUE(kids(ul)[0] == a);
+  EXPECT_TRUE(ul->firstChild() == a && ul->lastChild() == a);
+  EXPECT_TRUE(a->parentNode() == ul);
+  EXPECT_TRUE(b->parentNode() == nullptr);
+
+  // replacing a node with itself is a no-op
+  EXPECT_TRUE(ul->replaceChild(a, a));
+  ASSERT_EQ(kids(ul).size(), (size_t)1);
+
+  // replacing with a later sibling
+  auto c = makeEl(doc, "li", "c");
+  ul->appendChild(c);
+  EXPECT_TRUE(ul->replaceChild(c, a));
+  ASSERT_EQ(kids(ul).size(), (size_t)1);
+  EXPECT_TRUE(kids(ul)[0] == c);
+  EXPECT_TRUE(c->previousSibling() == nullptr && c->nextSibling() == nullptr);
+}
+
+TEST(Mutation_InsertBeforeItselfKeepsPosition) {
+  auto doc = std::make_shared<Document>();
+  auto p = makeEl(doc, "p");
+  auto x = makeEl(doc, "i", "x");
+  auto y = makeEl(doc, "i", "y");
+  auto z = makeEl(doc, "i", "z");
+  p->appendChild(x);
+  p->appendChild(y);
+  p->appendChild(z);
+
+  EXPECT_TRUE(p->insertBefore(y, y));
+  ASSERT_EQ(kids(p).size(), (size_t)3);
+  EXPECT_TRUE(kids(p)[1] == y);
+  EXPECT_TRUE(y->previousSibling() == x && y->nextSibling() == z);
+}
+
+TEST(Mutation_FragmentInsertsItsChildren) {
+  auto doc = std::make_shared<Document>();
+  auto ul = makeEl(doc, "ul");
+  auto last = makeEl(doc, "li", "last");
+  ul->appendChild(last);
+
+  auto frag = doc->createDocumentFragment();
+  auto li1 = makeEl(doc, "li", "li1");
+  auto li2 = makeEl(doc, "li", "li2");
+  frag->appendChild(li1);
+  frag->appendChild(li2);
+
+  EXPECT_TRUE(ul->insertBefore(frag, last));
+  ASSERT_EQ(kids(ul).size(), (size_t)3);
+  EXPECT_TRUE(kids(ul)[0] == li1 && kids(ul)[1] == li2 && kids(ul)[2] == last);
+  EXPECT_TRUE(li1->parentNode() == ul);
+  EXPECT_EQ(frag->childNodes().size(), (size_t)0);
+
+  auto frag2 = doc->createDocumentFragment();
+  auto li3 = makeEl(doc, "li", "li3");
+  frag2->appendChild(li3);
+  EXPECT_TRUE(ul->appendChild(frag2));
+  EXPECT_TRUE(ul->lastChild() == li3);
+  EXPECT_EQ(ul->getElementsByTagName("li").size(), (size_t)4);
+}
+
+TEST(Mutation_ClearingChildrenDetachesThem) {
+  auto doc = std::make_shared<Document>();
+  auto el = makeEl(doc, "div");
+  auto c = makeEl(doc, "span");
+  el->appendChild(c);
+
+  el->setTextContent("x");
+  EXPECT_TRUE(c->parentNode() == nullptr);
+  EXPECT_STREQ(el->textContent().c_str(), "x");
+
+  auto d = makeEl(doc, "b");
+  el->appendChild(d);
+  el->removeAllChildren();
+  EXPECT_TRUE(d->parentNode() == nullptr);
+  EXPECT_EQ(el->childNodes().size(), (size_t)0);
+}
+
+TEST(InsertAdjacentHTML_KeepsOrder) {
+  auto doc = std::make_shared<Document>();
+  auto body = makeEl(doc, "body");
+  auto el = makeEl(doc, "div", "target");
+  doc->appendChild(body);
+  body->appendChild(el);
+  el->appendChild(doc->createTextNode("x"));
+
+  el->insertAdjacentHTML("afterbegin", "<i>1</i><u>2</u>");
+  ASSERT_EQ(kids(el).size(), (size_t)3);
+  EXPECT_STREQ(kids(el)[0]->textContent().c_str(), "1");
+  EXPECT_STREQ(kids(el)[1]->textContent().c_str(), "2");
+
+  el->insertAdjacentHTML("afterend", "<em>3</em><b>4</b>");
+  auto after = el->nextSibling();
+  ASSERT_TRUE(after != nullptr);
+  EXPECT_STREQ(after->textContent().c_str(), "3");
+  ASSERT_TRUE(after->nextSibling() != nullptr);
+  EXPECT_STREQ(after->nextSibling()->textContent().c_str(), "4");
+}
+
 int main() {
   return xiaopeng::test::runTests();
 }
