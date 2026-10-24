@@ -49,8 +49,15 @@ public:
   }
 
   // Dispatch: call all listeners for the given IDs with an event object.
+  // Listeners run with this = event.currentTarget (DOM "inner invoke").
   static void dispatch(JSContext *ctx, const std::vector<uint32_t> &listenerIds,
                        JSValue eventObj) {
+    JSValue thisVal = JS_GetPropertyStr(ctx, eventObj, "currentTarget");
+    if (JS_IsException(thisVal)) {
+      JS_FreeValue(ctx, JS_GetException(ctx));
+      thisVal = JS_UNDEFINED;
+    }
+
     for (uint32_t id : listenerIds) {
       ListenerEntry entry;
       bool found = false;
@@ -68,7 +75,7 @@ public:
       }
 
       if (found) {
-        JSValue ret = JS_Call(ctx, entry.callback, JS_UNDEFINED, 1, &eventObj);
+        JSValue ret = JS_Call(ctx, entry.callback, thisVal, 1, &eventObj);
         if (JS_IsException(ret)) {
           JSValue exc = JS_GetException(ctx);
           const char *str = JS_ToCString(ctx, exc);
@@ -82,6 +89,16 @@ public:
         JS_FreeValue(ctx, entry.callback); // Release our local reference
       }
     }
+
+    JS_FreeValue(ctx, thisVal);
+  }
+
+  // True when listener id was registered with exactly this function object
+  static bool isSameCallback(uint32_t id, JSContext *ctx, JSValueConst fn) {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    auto it = s_listeners.find(id);
+    return it != s_listeners.end() &&
+           JS_StrictEq(ctx, it->second.callback, fn);
   }
 
   // Create a simple JS event object: { type: "...", target: null }

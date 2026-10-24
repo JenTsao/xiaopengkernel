@@ -96,6 +96,10 @@ void ScriptEngine::evaluate(const std::string &script,
   }
 
   JS_FreeValue(m_ctx, val);
+
+  // "Clean up after running script": promise reactions queued by the script
+  // run before anything else (timers, events, the next frame)
+  tickMicrotasks();
 #endif
 }
 
@@ -124,29 +128,7 @@ bool ScriptEngine::tickMicrotasks() {
 #ifdef ENABLE_QUICKJS
   if (!m_initialized || !m_ctx)
     return false;
-
-  JSContext *ctx1;
-  int err;
-  bool executed = false;
-
-  for (;;) {
-    err = JS_ExecutePendingJob(JS_GetRuntime(m_ctx), &ctx1);
-    if (err <= 0) {
-      if (err < 0) {
-        // Exception
-        JSValue exception = JS_GetException(ctx1);
-        const char *str = JS_ToCString(ctx1, exception);
-        if (str) {
-          std::cerr << "Microtask Exception: " << str << std::endl;
-          JS_FreeCString(ctx1, str);
-        }
-        JS_FreeValue(ctx1, exception);
-      }
-      break;
-    }
-    executed = true;
-  }
-  return executed;
+  return TimerBinding::runMicrotasks(m_ctx);
 #else
   return false;
 #endif

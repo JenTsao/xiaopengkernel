@@ -7,9 +7,11 @@
 // A test "passes" if it prints "PASS" and doesn't crash.
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "../include/dom/dom.hpp"
 #include "../include/script/script_engine.hpp"
@@ -94,12 +96,36 @@ static std::shared_ptr<Document> buildTestDOM() {
 static int g_total = 0;
 static int g_passed = 0;
 
+// Evaluate and return the completion value as a string ("EXCEPTION: ..." if
+// the script throws outside its own try/catch)
+static std::string evalToString(ScriptEngine &engine, const std::string &code) {
+  JSContext *ctx = engine.getContext();
+  JSValue v = JS_Eval(ctx, code.c_str(), code.size(), "test.js", 0);
+  std::string result;
+  if (JS_IsException(v)) {
+    JSValue exc = JS_GetException(ctx);
+    const char *s = JS_ToCString(ctx, exc);
+    result = std::string("EXCEPTION: ") + (s ? s : "?");
+    if (s)
+      JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, exc);
+  } else {
+    const char *s = JS_ToCString(ctx, v);
+    result = s ? s : "";
+    if (s)
+      JS_FreeCString(ctx, s);
+  }
+  JS_FreeValue(ctx, v);
+  engine.tickMicrotasks();
+  return result;
+}
+
 static void runTest(ScriptEngine &engine, const char *name,
                     const std::string &jsCode) {
   g_total++;
   std::cout << "  [TEST] " << name << " ... " << std::flush;
 
-  // Wrap in a try-catch IIFE that prints PASS/FAIL
+  // Wrap in a try-catch IIFE that returns PASS/FAIL
   std::string wrapped = R"JS(
     (function() {
       try {
@@ -111,11 +137,13 @@ static void runTest(ScriptEngine &engine, const char *name,
     })()
   )JS";
 
-  engine.evaluate(wrapped, "test.js");
-  // If we got here without crashing, count as passed
-  // (console output from the JS code will show details)
-  g_passed++;
-  std::cout << "✅ (executed)" << std::endl;
+  std::string result = evalToString(engine, wrapped);
+  if (result == "PASS") {
+    g_passed++;
+    std::cout << "✅" << std::endl;
+  } else {
+    std::cout << "❌ " << result << std::endl;
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -136,6 +164,11 @@ int main() {
     return 1;
   }
   engine.registerDOM(doc);
+  // console.assert only logs (browser semantics); in these tests a failed
+  // assertion must fail the test
+  engine.evaluate("console.assert = function(c, m) {"
+                  "  if (!c) throw new Error(m || 'assertion failed'); };",
+                  "setup.js");
 
   // ─── Document Properties ───────────────────────────────────
 
@@ -418,7 +451,7 @@ int main() {
   runTest(engine, "element.lastElementChild", R"JS(
     var lec = document.getElementById('main').lastElementChild;
     console.assert(lec !== null, 'lastElementChild should not be null');
-    console.assert(lec.id === 'ul', 'should be ul, got: ' + lec.id);
+    console.assert(lec.id === 'list', 'should be the ul#list, got: ' + lec.id);
     console.log('  #main.lastElementChild.id = ' + lec.id);
   )JS");
 
@@ -604,12 +637,15 @@ int main() {
   )JS");
 
   runTest(engine, "querySelector: attribute operators + pseudo", R"JS(
-    var li2 = document.querySelectorAll('li:nth-child(2)');
-    console.assert(li2.length === 1 && li2[0].id === 'li2', 'nth-child(2) should be li2');
+    // own list: the shared #list was rearranged by the section 07 tests
+    var ul = document.createElement('ul');
+    ul.innerHTML = '<li id="q1"></li><li id="q2"></li>';
+    var second = ul.querySelectorAll('li:nth-child(2)');
+    console.assert(second.length === 1 && second[0].id === 'q2', 'nth-child(2) should be q2');
     var notMuted = document.querySelectorAll('p:not(.muted)');
     console.assert(notMuted.length === 1 && notMuted[0].id === 'p1', ':not(.muted) should be p1');
-    var starts = document.querySelectorAll('[id^="li"]');
-    console.assert(starts.length === 2, '[id^="li"] should find 2');
+    var starts = ul.querySelectorAll('[id^="q"]');
+    console.assert(starts.length === 2, '[id^="q"] should find 2');
     console.log('  attribute operators + pseudo OK');
   )JS");
 
@@ -651,7 +687,8 @@ int main() {
     console.assert(parent.children[1].id === 'c', 'after should insert at index 1');
     var x = document.createElement('span'); x.id = 'x';
     b.before(x);
-    console.assert(parent.children.length === 3 && parent.children[2].id === 'b', 'before should insert before b');
+    console.assert(parent.children.length === 4 && parent.children[2].id === 'x' &&
+                   parent.children[3].id === 'b', 'before should insert x right before b');
     x.replaceWith('text!');
     console.assert(parent.childNodes[2].nodeType === 3, 'replaceWith string becomes Text node');
     a.remove();
@@ -733,9 +770,12 @@ int main() {
     var clone = document.importNode(li1, true);
     console.assert(clone !== null && clone.parentNode === null, 'importNode should return an unattached clone');
 
-    var li2 = document.getElementById('li2');
-    document.adoptNode(li2);
-    console.assert(document.getElementById('li2') === null, 'adoptNode should detach li2');
+    // li2 was removed by the section 07 tests; adopt a node of our own
+    var adoptee = document.createElement('li');
+    adoptee.id = 'adopt-me';
+    document.body.appendChild(adoptee);
+    document.adoptNode(adoptee);
+    console.assert(document.getElementById('adopt-me') === null, 'adoptNode should detach the node');
 
     console.assert(document.getElementsByName('nope').length === 0, 'getElementsByName should be empty');
     console.log('  document extended methods OK');
@@ -757,6 +797,104 @@ int main() {
     console.assert(fired === true, 'capture listener should fire at target');
     el.removeEventListener('ping', function() {}, true);
     console.log('  capture option OK');
+  )JS");
+
+  // ─── Regression: identity, listeners, mutation errors, timers ───
+
+  std::cout << "\n── Regression ──" << std::endl;
+
+  runTest(engine, "node wrappers keep identity", R"JS(
+    console.assert(document.body === document.body, 'body === body');
+    console.assert(document.getElementById('p1') === document.querySelector('#p1'),
+                   'getElementById and querySelector return the same object');
+    var p1 = document.getElementById('p1');
+    console.assert(p1.parentNode === document.getElementById('main'), 'parentNode identity');
+  )JS");
+
+  runTest(engine, "listener this is currentTarget", R"JS(
+    var el = document.createElement('div');
+    var self = null;
+    el.addEventListener('ping', function() { self = this; });
+    el.dispatchEvent('ping');
+    console.assert(self === el, 'this should be the element');
+  )JS");
+
+  runTest(engine, "removeEventListener matches the function", R"JS(
+    var el = document.createElement('div');
+    var a = 0, b = 0;
+    function fa() { a++; }
+    function fb() { b++; }
+    el.addEventListener('x', fa);
+    el.addEventListener('x', fb);
+    el.addEventListener('x', fb);           // duplicate: ignored
+    el.removeEventListener('x', function() {});  // unknown: no-op
+    el.removeEventListener('x', fa);
+    el.dispatchEvent('x');
+    console.assert(a === 0, 'removed listener must not fire, a=' + a);
+    console.assert(b === 1, 'remaining listener fires once, b=' + b);
+    el.addEventListener('y', fa, {capture: true});
+    el.removeEventListener('y', fa, {capture: true});
+    el.dispatchEvent('y');
+    console.assert(a === 0, 'capture option object, a=' + a);
+  )JS");
+
+  runTest(engine, "appendChild cycle throws HierarchyRequestError", R"JS(
+    var outer = document.createElement('div');
+    var inner = document.createElement('span');
+    outer.appendChild(inner);
+    var name = '';
+    try { inner.appendChild(outer); } catch (e) { name = e.name; }
+    console.assert(name === 'HierarchyRequestError', 'got: ' + name);
+    console.assert(outer.textContent === '', 'tree still usable');
+  )JS");
+
+  runTest(engine, "appendChild(fragment) moves its children", R"JS(
+    var f = document.createDocumentFragment();
+    var li = document.createElement('li');
+    f.appendChild(li);
+    var ul = document.createElement('ul');
+    ul.appendChild(f);
+    console.assert(ul.children.length === 1, 'ul has the li');
+    console.assert(li.parentNode === ul, 'li parent is ul');
+    console.assert(f.childNodes.length === 0, 'fragment emptied');
+  )JS");
+
+  runTest(engine, "isEqualNode compares deeply and by type", R"JS(
+    var a = document.createElement('div');
+    a.innerHTML = '<p>a</p>';
+    var b = document.createElement('div');
+    b.innerHTML = '<p>b</p>';
+    var c = document.createElement('div');
+    c.innerHTML = '<p>a</p>';
+    console.assert(a.isEqualNode(b) === false, 'different text');
+    console.assert(a.isEqualNode(c) === true, 'same content');
+    console.assert(a.isEqualNode(document.createComment('x')) === false, 'comment');
+  )JS");
+
+  engine.evaluate(R"JS(
+    var timerLog = [];
+    var selfClearCount = 0;
+    var selfClearId = setInterval(function() {
+      selfClearCount++;
+      clearInterval(selfClearId);
+    }, 0);
+    setTimeout(function(a, b) { timerLog.push('args:' + a + b); }, 0, 'x', 'y');
+    setTimeout(function() { timerLog.push('nan'); }, undefined);
+    setTimeout(function() {
+      timerLog.push('t1');
+      Promise.resolve().then(function() { timerLog.push('p1'); });
+    }, 0);
+    setTimeout(function() { timerLog.push('t2'); }, 0);
+    Promise.resolve().then(function() { timerLog.push('script-microtask'); });
+  )JS", "timers.js");
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  engine.tickTimers();
+  engine.tickTimers();
+
+  runTest(engine, "timers: self-clear, args, NaN delay, microtask checkpoints", R"JS(
+    console.assert(selfClearCount === 1, 'interval ran ' + selfClearCount + ' times');
+    var log = timerLog.join(',');
+    console.assert(log === 'script-microtask,args:xy,nan,t1,p1,t2', 'log: ' + log);
   )JS");
 
   // ─── Summary ───────────────────────────────────────────────

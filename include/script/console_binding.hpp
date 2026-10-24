@@ -26,6 +26,8 @@ public:
                       JS_NewCFunction(ctx, params_log, "warn", 1));
     JS_SetPropertyStr(ctx, console, "error",
                       JS_NewCFunction(ctx, params_log, "error", 1));
+    JS_SetPropertyStr(ctx, console, "assert",
+                      JS_NewCFunction(ctx, console_assert, "assert", 1));
 
     // Set global console
     JSValue global = JS_GetGlobalObject(ctx);
@@ -34,6 +36,22 @@ public:
   }
 
 private:
+  // console.assert(condition, ...data): logs when condition is falsy and,
+  // like browsers, never throws
+  static JSValue console_assert(JSContext *ctx, JSValueConst this_val, int argc,
+                                JSValueConst *argv) {
+    (void)this_val;
+    if (argc >= 1 && JS_ToBool(ctx, argv[0]) > 0)
+      return JS_UNDEFINED;
+    std::string output = "Assertion failed";
+    for (int i = 1; i < argc; ++i) {
+      output += (i == 1 ? ": " : " ");
+      output += JSBinding::toStdString(ctx, argv[i]);
+    }
+    std::cerr << "[JS Console] " << output << std::endl;
+    return JS_UNDEFINED;
+  }
+
   static JSValue params_log(JSContext *ctx, JSValueConst this_val, int argc,
                             JSValueConst *argv) {
     (void)this_val;

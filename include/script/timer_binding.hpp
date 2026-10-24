@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -16,6 +17,7 @@ public:
   struct TimerEntry {
     uint32_t id;
     JSValue callback; // DupValue'd, must be freed
+    std::vector<JSValue> args; // extra arguments, DupValue'd, must be freed
     JSContext *ctx;
     double fireTimeMs; // Absolute time when timer should fire
     double intervalMs; // >0 for setInterval, 0 for setTimeout
@@ -39,6 +41,29 @@ public:
     JS_FreeValue(ctx, global);
   }
 
+  // HTML "perform a microtask checkpoint": run every pending promise job. A
+  // job that throws is reported and does not stop the remaining ones.
+  static bool runMicrotasks(JSContext *ctx) {
+    bool executed = false;
+    JSContext *jobCtx = nullptr;
+    for (;;) {
+      int err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &jobCtx);
+      if (err == 0)
+        break;
+      executed = true;
+      if (err < 0) {
+        JSValue exc = JS_GetException(jobCtx);
+        const char *str = JS_ToCString(jobCtx, exc);
+        if (str) {
+          std::cerr << "Microtask Exception: " << str << std::endl;
+          JS_FreeCString(jobCtx, str);
+        }
+        JS_FreeValue(jobCtx, exc);
+      }
+    }
+    return executed;
+  }
+
   // Called each frame from main loop. Returns true if any timer fired.
   static bool tick() {
     double now = currentTimeMs();
@@ -57,71 +82,60 @@ public:
     }
 
     for (uint32_t id : toFire) {
-      TimerEntry t_copy;
-      {
-        std::lock_guard<std::mutex> lock(s_mutex);
-        auto it = s_timers.find(id);
-        if (it == s_timers.end())
-          continue;
-        if (it->second.cancelled)
-          continue;
-        t_copy = it->second; // Copy to run callback outside lock (optional but
-                             // safer for reentrancy?)
-                             // Actually we need to update state in map.
-                             // Let's keep lock short or just copy?
-        // If callback calls setTimeout, it will try to lock s_mutex.
-        // IF we hold lock while calling JS_Call, DEADLOCK.
-        // So we MUST release lock before JS_Call.
-      }
-
-      // But we need to use 't' which refers to map entry...
-      // Map iterators might invalidate? No, std::map iterators are stable
-      // unless erased. But if we unlock, s_timers might change.
-
-      // Re-acquire logic:
-      bool cancelled = false;
-      TimerEntry t;
+      // Take our own references: the callback may clearTimeout/clearInterval
+      // its own id, which frees the entry's values while they still run
+      JSContext *ctx = nullptr;
+      JSValue fn = JS_UNDEFINED;
+      std::vector<JSValue> args;
+      double intervalMs = 0;
       {
         std::lock_guard<std::mutex> lock(s_mutex);
         auto it = s_timers.find(id);
         if (it == s_timers.end() || it->second.cancelled)
-          cancelled = true;
-        else
-          t = it->second;
+          continue;
+        ctx = it->second.ctx;
+        fn = JS_DupValue(ctx, it->second.callback);
+        for (const auto &a : it->second.args)
+          args.push_back(JS_DupValue(ctx, a));
+        intervalMs = it->second.intervalMs;
       }
 
-      if (cancelled)
-        continue;
-
-      // Call the JS callback
-      JSValue ret = JS_Call(t.ctx, t.callback, JS_UNDEFINED, 0, nullptr);
+      // The lock is released while JS runs: the callback may call
+      // setTimeout/clearTimeout, which lock s_mutex themselves
+      JSValue ret = JS_Call(ctx, fn, JS_UNDEFINED, static_cast<int>(args.size()),
+                            args.data());
       if (JS_IsException(ret)) {
-        JSValue exc = JS_GetException(t.ctx);
-        const char *str = JS_ToCString(t.ctx, exc);
+        JSValue exc = JS_GetException(ctx);
+        const char *str = JS_ToCString(ctx, exc);
         if (str) {
           std::cout << "[Timer] Exception in handler (id=" << id << "): " << str
                     << std::endl;
-          JS_FreeCString(t.ctx, str);
+          JS_FreeCString(ctx, str);
         }
-        JS_FreeValue(t.ctx, exc);
+        JS_FreeValue(ctx, exc);
       }
-      JS_FreeValue(t.ctx, ret);
+      JS_FreeValue(ctx, ret);
+      for (auto &a : args)
+        JS_FreeValue(ctx, a);
+      JS_FreeValue(ctx, fn);
       fired = true;
 
       {
         std::lock_guard<std::mutex> lock(s_mutex);
         auto it = s_timers.find(id);
         if (it != s_timers.end()) {
-          if (t.intervalMs > 0 && !it->second.cancelled) {
+          if (intervalMs > 0 && !it->second.cancelled) {
             // Reschedule for next interval
-            it->second.fireTimeMs = now + t.intervalMs;
+            it->second.fireTimeMs = now + intervalMs;
           } else {
             // One-shot: remove
-            JS_FreeValue(it->second.ctx, it->second.callback);
+            release(it->second);
             s_timers.erase(it);
           }
         }
       }
+
+      runMicrotasks(ctx);
     }
 
     return fired;
@@ -131,7 +145,7 @@ public:
   static void cleanup() {
     std::lock_guard<std::mutex> lock(s_mutex);
     for (auto &pair : s_timers) {
-      JS_FreeValue(pair.second.ctx, pair.second.callback);
+      release(pair.second);
     }
     s_timers.clear();
   }
@@ -141,6 +155,13 @@ private:
   static inline uint32_t s_nextId = 1;
   static inline std::mutex s_mutex;
 
+  static void release(TimerEntry &entry) {
+    JS_FreeValue(entry.ctx, entry.callback);
+    for (auto &a : entry.args)
+      JS_FreeValue(entry.ctx, a);
+    entry.args.clear();
+  }
+
   static double currentTimeMs() {
     using namespace std::chrono;
     return static_cast<double>(
@@ -148,58 +169,49 @@ private:
             .count());
   }
 
-  // setTimeout(callback, delayMs) -> timerId
+  // setTimeout/setInterval(callback, delayMs, ...args) -> timerId
+  static JSValue addTimer(JSContext *ctx, int argc, JSValueConst *argv,
+                          bool repeat) {
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+      return JS_ThrowTypeError(ctx, "Timer callback must be a function");
+
+    // HTML: a missing, NaN or negative timeout is 0. Intervals keep a 1 ms
+    // floor so a zero interval cannot spin the event loop.
+    double delay = 0;
+    if (argc >= 2 && JS_ToFloat64(ctx, &delay, argv[1]) < 0)
+      return JS_EXCEPTION;
+    if (!(delay >= 0) || std::isinf(delay))
+      delay = 0;
+    if (repeat && delay < 1)
+      delay = 1;
+
+    TimerEntry entry;
+    entry.id = s_nextId++;
+    entry.callback = JS_DupValue(ctx, argv[0]);
+    for (int i = 2; i < argc; ++i)
+      entry.args.push_back(JS_DupValue(ctx, argv[i]));
+    entry.ctx = ctx;
+    entry.fireTimeMs = currentTimeMs() + delay;
+    entry.intervalMs = repeat ? delay : 0;
+    entry.cancelled = false;
+
+    {
+      std::lock_guard<std::mutex> lock(s_mutex);
+      s_timers[entry.id] = entry;
+    }
+    return JS_NewInt32(ctx, static_cast<int32_t>(entry.id));
+  }
+
   static JSValue js_setTimeout(JSContext *ctx, JSValueConst this_val, int argc,
                                JSValueConst *argv) {
     (void)this_val;
-    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
-      return JS_EXCEPTION;
-
-    double delay = 0;
-    if (argc >= 2)
-      JS_ToFloat64(ctx, &delay, argv[1]);
-
-    TimerEntry entry;
-    entry.id = s_nextId++;
-    entry.callback = JS_DupValue(ctx, argv[0]);
-    entry.ctx = ctx;
-    entry.fireTimeMs = currentTimeMs() + delay;
-    entry.intervalMs = 0; // one-shot
-    entry.cancelled = false;
-
-    {
-      std::lock_guard<std::mutex> lock(s_mutex);
-      s_timers[entry.id] = entry;
-    }
-    return JS_NewInt32(ctx, entry.id);
+    return addTimer(ctx, argc, argv, false);
   }
 
-  // setInterval(callback, intervalMs) -> timerId
   static JSValue js_setInterval(JSContext *ctx, JSValueConst this_val, int argc,
                                 JSValueConst *argv) {
     (void)this_val;
-    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
-      return JS_EXCEPTION;
-
-    double interval = 0;
-    if (argc >= 2)
-      JS_ToFloat64(ctx, &interval, argv[1]);
-    if (interval <= 0)
-      interval = 1; // minimum 1ms to prevent infinite loop
-
-    TimerEntry entry;
-    entry.id = s_nextId++;
-    entry.callback = JS_DupValue(ctx, argv[0]);
-    entry.ctx = ctx;
-    entry.fireTimeMs = currentTimeMs() + interval;
-    entry.intervalMs = interval;
-    entry.cancelled = false;
-
-    {
-      std::lock_guard<std::mutex> lock(s_mutex);
-      s_timers[entry.id] = entry;
-    }
-    return JS_NewInt32(ctx, entry.id);
+    return addTimer(ctx, argc, argv, true);
   }
 
   // clearTimeout(id)
@@ -209,14 +221,15 @@ private:
     if (argc < 1)
       return JS_UNDEFINED;
 
-    int32_t id;
-    JS_ToInt32(ctx, &id, argv[0]);
+    int32_t id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0)
+      return JS_EXCEPTION;
 
     std::lock_guard<std::mutex> lock(s_mutex);
     auto it = s_timers.find(static_cast<uint32_t>(id));
     if (it != s_timers.end()) {
       it->second.cancelled = true;
-      JS_FreeValue(it->second.ctx, it->second.callback);
+      release(it->second);
       s_timers.erase(it);
     }
     return JS_UNDEFINED;

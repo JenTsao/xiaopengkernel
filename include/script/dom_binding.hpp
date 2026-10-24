@@ -5,8 +5,10 @@
 #include <dom/dom_enhancements.hpp>
 #include <dom/html_parser.hpp>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <quickjs.h>
 #include <script/event_binding.hpp>
 #include <script/js_binding.hpp>
@@ -186,6 +188,9 @@ public:
   // ── wrapElement ─────────────────────────────────────────────
   static JSValue wrapElement(JSContext *ctx, dom::Element *el) {
     if (!el) return JS_NULL;
+    JSValue cached = findWrapper(ctx, el);
+    if (!JS_IsUninitialized(cached))
+      return cached;
     {
         std::lock_guard<std::mutex> lock(s_mutex);
         try {
@@ -195,13 +200,14 @@ public:
     JSValue obj = JS_NewObjectClass(ctx, s_elementClassId);
     if (JS_IsException(obj))
       return obj;
+    rememberWrapper(ctx, el, obj);
 
     JS_SetOpaque(obj, el);
 
     // --- Existing properties ---
     bindGetSet(ctx, obj, "innerHTML",
                element_get_innerHTML, element_set_innerHTML);
-    bindReadOnly(ctx, obj, "id",      element_get_id);
+    bindGetSet(ctx, obj, "id",        element_get_id, element_set_id);
     bindReadOnly(ctx, obj, "tagName", element_get_tagName);
     bindGetSet(ctx, obj, "textContent",
                element_get_textContent, element_set_textContent);
@@ -300,6 +306,9 @@ public:
   // ── wrapTextNode ────────────────────────────────────────────
   static JSValue wrapTextNode(JSContext *ctx, dom::TextNode *node) {
     if (!node) return JS_NULL;
+    JSValue cached = findWrapper(ctx, node);
+    if (!JS_IsUninitialized(cached))
+      return cached;
     {
         std::lock_guard<std::mutex> lock(s_mutex);
         try {
@@ -309,6 +318,7 @@ public:
     JSValue obj = JS_NewObjectClass(ctx, s_textNodeClassId);
     if (JS_IsException(obj))
       return obj;
+    rememberWrapper(ctx, node, obj);
 
     JS_SetOpaque(obj, node);
 
@@ -345,12 +355,16 @@ public:
   static JSValue wrapFragment(JSContext *ctx,
                               std::shared_ptr<dom::DocumentFragment> frag) {
     if (!frag) return JS_NULL;
+    JSValue cached = findWrapper(ctx, frag.get());
+    if (!JS_IsUninitialized(cached))
+      return cached;
     {
       std::lock_guard<std::mutex> lock(s_mutex);
       s_createdNodes.push_back(frag);
     }
     JSValue obj = JS_NewObjectClass(ctx, s_elementClassId);
     if (JS_IsException(obj)) return obj;
+    rememberWrapper(ctx, frag.get(), obj);
 
     JS_SetOpaque(obj, static_cast<dom::Node *>(frag.get()));
     JS_SetPropertyStr(ctx, obj, "nodeType", JS_NewInt32(ctx, 11));
@@ -443,6 +457,10 @@ public:
 
   static void cleanup() {
     std::lock_guard<std::mutex> lock(s_mutex);
+    for (auto &entry : s_wrappers) {
+      JS_FreeValue(entry.first.first, entry.second);
+    }
+    s_wrappers.clear();
     s_createdElements.clear();
     s_createdNodes.clear();
   }
@@ -458,6 +476,27 @@ private:
   static inline std::vector<std::weak_ptr<dom::Element>> s_createdElements;
   static inline std::vector<dom::NodePtr> s_createdNodes; // BUG FIX: track all created nodes
   static inline std::mutex s_mutex;
+  // One wrapper per node, so node === node holds in JS (and the ~70
+  // accessors are not rebuilt on every access). Nodes stay alive through
+  // s_createdNodes, so a node address is never reused while cached.
+  static inline std::map<std::pair<JSContext *, const dom::Node *>, JSValue>
+      s_wrappers;
+
+  static JSValue findWrapper(JSContext *ctx, const dom::Node *node) {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    auto it = s_wrappers.find({ctx, node});
+    return it == s_wrappers.end() ? JS_UNINITIALIZED
+                                  : JS_DupValue(ctx, it->second);
+  }
+
+  static JSValue rememberWrapper(JSContext *ctx, const dom::Node *node,
+                                 JSValue obj) {
+    if (JS_IsException(obj))
+      return obj;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    s_wrappers[{ctx, node}] = JS_DupValue(ctx, obj);
+    return obj;
+  }
 
   // ── Helper: get Node* from either element or text class ──
   static dom::Node *getNodeFromThis(JSContext *ctx, JSValueConst this_val) {
@@ -1643,6 +1682,16 @@ public:
     return JSBinding::toJSString(ctx, el->id());
   }
 
+  // element.id = value (reflects the id attribute)
+  static JSValue element_set_id(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    dom::Node *node = getNodeFromThis(ctx, this_val);
+    if (!node || node->nodeType() != dom::NodeType::Element || argc < 1)
+      return JS_UNDEFINED;
+    static_cast<dom::Element *>(node)->setId(JSBinding::toStdString(ctx, argv[0]));
+    return JS_UNDEFINED;
+  }
+
   // element.tagName getter
   static JSValue element_get_tagName(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv) {
@@ -1952,46 +2001,70 @@ public:
 
   // ── Event methods ──
 
-  // element.addEventListener(type, callback[, capture=false])
+  // The capture flag of add/removeEventListener: a boolean or an options
+  // object with a "capture" member
+  static bool readCaptureOption(JSContext *ctx, JSValueConst value) {
+    if (JS_IsObject(value)) {
+      JSValue capture = JS_GetPropertyStr(ctx, value, "capture");
+      bool result = JS_ToBool(ctx, capture) > 0;
+      JS_FreeValue(ctx, capture);
+      return result;
+    }
+    return JS_ToBool(ctx, value) > 0;
+  }
+
+  // Index of the listener registered on node for (type, callback, capture)
+  static long long findListener(dom::Node *node, const std::string &type,
+                                JSContext *ctx, JSValueConst callback,
+                                bool capture) {
+    auto it = node->eventListenerIds_.find(type);
+    if (it == node->eventListenerIds_.end())
+      return -1;
+    for (size_t i = 0; i < it->second.size(); ++i) {
+      if (it->second[i].capture == capture &&
+          EventBinding::isSameCallback(it->second[i].id, ctx, callback))
+        return (long long)i;
+    }
+    return -1;
+  }
+
+  // element.addEventListener(type, callback[, capture | {capture}])
   static JSValue element_addEventListener(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv) {
     dom::Node *node = getNodeFromThis(ctx, this_val);
-    if (!node || argc < 2) return JS_EXCEPTION;
-    if (!JS_IsFunction(ctx, argv[1])) return JS_EXCEPTION;
+    if (!node)
+      return JS_ThrowTypeError(ctx, "Illegal invocation");
+    if (argc < 2)
+      return JS_ThrowTypeError(ctx, "addEventListener needs 2 arguments");
+    // A null callback is a no-op per the DOM spec
+    if (!JS_IsFunction(ctx, argv[1]))
+      return JS_UNDEFINED;
 
     std::string type = JSBinding::toStdString(ctx, argv[0]);
-    bool capture = argc >= 3 && JS_ToBool(ctx, argv[2]) != 0;
+    bool capture = argc >= 3 && readCaptureOption(ctx, argv[2]);
+    // Registering the same (type, callback, capture) twice is ignored
+    if (findListener(node, type, ctx, argv[1], capture) >= 0)
+      return JS_UNDEFINED;
     uint32_t id = EventBinding::addListener(ctx, argv[1]);
     node->addEventListener(type, id, capture);
     return JS_UNDEFINED;
   }
 
-  // element.removeEventListener(type, callback[, capture])
-  // std::function identity isn't available across the binding, so the last
-  // matching entry (by capture flag when provided) is removed.
+  // element.removeEventListener(type, callback[, capture | {capture}]) —
+  // removes the listener registered with that same function and capture flag
   static JSValue element_removeEventListener(JSContext *ctx, JSValueConst this_val,
                                               int argc, JSValueConst *argv) {
     dom::Node *node = getNodeFromThis(ctx, this_val);
-    if (!node || argc < 2) return JS_EXCEPTION;
+    if (!node)
+      return JS_ThrowTypeError(ctx, "Illegal invocation");
+    if (argc < 2)
+      return JS_ThrowTypeError(ctx, "removeEventListener needs 2 arguments");
 
     std::string type = JSBinding::toStdString(ctx, argv[0]);
-    auto it = node->eventListenerIds_.find(type);
-    if (it == node->eventListenerIds_.end() || it->second.empty()) {
-      return JS_UNDEFINED;
-    }
-
-    bool captureSpecified = argc >= 3 && !JS_IsUndefined(argv[2]) &&
-                            !JS_IsNull(argv[2]);
-    bool capture = captureSpecified ? JS_ToBool(ctx, argv[2]) != 0 : false;
-
-    long long removeIdx = -1;
-    for (size_t i = it->second.size(); i-- > 0;) {
-      if (!captureSpecified || it->second[i].capture == capture) {
-        removeIdx = (long long)i;
-        break;
-      }
-    }
+    bool capture = argc >= 3 && readCaptureOption(ctx, argv[2]);
+    long long removeIdx = findListener(node, type, ctx, argv[1], capture);
     if (removeIdx >= 0) {
+      auto it = node->eventListenerIds_.find(type);
       uint32_t id = it->second[(size_t)removeIdx].id;
       EventBinding::removeListener(id);
       it->second.erase(it->second.begin() + removeIdx);
