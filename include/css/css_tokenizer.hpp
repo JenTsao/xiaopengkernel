@@ -481,6 +481,8 @@ private:
     case '<':
       consume();
       if (peek() == '!' && peekNext() == '-' && peek(2) == '-') {
+        // "<!--": all three characters after '<' belong to the CDO token
+        consume();
         consume();
         consume();
         return {TokenType::CDO};
