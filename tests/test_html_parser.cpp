@@ -1,6 +1,7 @@
 #include "test_framework.hpp"
 #include "loader/loader_all.hpp"
 #include "dom/dom_enhancements.hpp"
+#include <algorithm>
 
 using namespace xiaopeng::loader;
 using namespace xiaopeng::dom;
@@ -632,4 +633,145 @@ TEST(FragmentParsing_InsertAdjacentTd) {
     td->insertAdjacentHTML("afterend", "<td>next</td>");
     ASSERT_EQ(tr->childElementCount(), (size_t)2);
     EXPECT_STREQ(tr->lastElementChild()->textContent().c_str(), "next");
+}
+
+// ── Regression: tokenizer ────────────────────────────────────
+
+namespace {
+
+std::string firstText(const std::shared_ptr<Document> &doc,
+                      const std::string &tag) {
+    auto elems = doc->getElementsByTagName(tag);
+    return elems.empty() ? std::string("<missing>") : elems[0]->textContent();
+}
+
+std::string attr(const std::shared_ptr<Document> &doc, const std::string &tag,
+                 const std::string &name) {
+    auto elems = doc->getElementsByTagName(tag);
+    if (elems.empty())
+        return "<missing>";
+    return elems[0]->getAttribute(name).value_or("<none>");
+}
+
+} // namespace
+
+TEST(Tokenizer_EofAfterLessThanTerminates) {
+    // The '<' / '</' flushed at EOF used to be re-emitted forever
+    {
+        HtmlTokenizer tokenizer(std::string("a<"));
+        auto tokens = tokenizer.tokenize();
+        ASSERT_EQ(tokens.size(), (size_t)3);
+        EXPECT_STREQ(tokens[0].data.c_str(), "a");
+        EXPECT_STREQ(tokens[1].data.c_str(), "<");
+        EXPECT_TRUE(tokens[2].isEndOfFile());
+    }
+    {
+        HtmlTokenizer tokenizer(std::string("x </"));
+        auto tokens = tokenizer.tokenize();
+        ASSERT_EQ(tokens.size(), (size_t)3);
+        EXPECT_STREQ(tokens[1].data.c_str(), "</");
+    }
+}
+
+TEST(Tokenizer_UnmatchedReferenceKeepsText) {
+    auto result = HtmlParser::parseHtml("<p>AT&T a &- b &#; x&zz;y &order</p>");
+    EXPECT_STREQ(firstText(result.document, "p").c_str(),
+                 "AT&T a &- b &#; x&zz;y &order");
+}
+
+TEST(Tokenizer_AttributeReferenceRules) {
+    auto result = HtmlParser::parseHtml(
+        "<a href=\"?q=1&lang=en&copy=2&amp;x=3\" title=\"Q&A\">L</a>"
+        "<b title=\"x&\">bold</b>");
+    // non-legacy names need ';', legacy ones before '=' stay literal
+    EXPECT_STREQ(attr(result.document, "a", "href").c_str(),
+                 "?q=1&lang=en&copy=2&x=3");
+    EXPECT_STREQ(attr(result.document, "a", "title").c_str(), "Q&A");
+    // a trailing '&' must not swallow the closing quote
+    EXPECT_STREQ(attr(result.document, "b", "title").c_str(), "x&");
+    EXPECT_STREQ(firstText(result.document, "b").c_str(), "bold");
+}
+
+TEST(Tokenizer_NumericReferenceLimits) {
+    auto result = HtmlParser::parseHtml(
+        "<p>&#4294967361;</p><i>&#x110000;</i><u>&#129;</u>");
+    EXPECT_TRUE(firstText(result.document, "p") == "\xEF\xBF\xBD");
+    EXPECT_TRUE(firstText(result.document, "i") == "\xEF\xBF\xBD");
+    // 0x81 has no windows-1252 glyph: the code point itself is kept
+    EXPECT_TRUE(firstText(result.document, "u") == "\xC2\x81");
+}
+
+TEST(TreeBuilder_RawTextElements) {
+    auto result = HtmlParser::parseHtml(
+        "<title>a<b>c &amp; d</title>"
+        "<style>div > p { color: red; }</style>"
+        "<script>if (a<b) f(\"</div>\");</script>"
+        "<p>Hi</p><textarea><b>x</b></textarea>");
+    EXPECT_STREQ(firstText(result.document, "title").c_str(), "a<b>c & d");
+    EXPECT_STREQ(firstText(result.document, "style").c_str(),
+                 "div > p { color: red; }");
+    EXPECT_STREQ(firstText(result.document, "script").c_str(),
+                 "if (a<b) f(\"</div>\");");
+    EXPECT_STREQ(firstText(result.document, "p").c_str(), "Hi");
+    EXPECT_STREQ(firstText(result.document, "textarea").c_str(), "<b>x</b>");
+    // markup inside raw text must not become elements
+    EXPECT_EQ(result.document->getElementsByTagName("b").size(), (size_t)0);
+}
+
+TEST(Tokenizer_BogusCommentKeepsFirstCharacter) {
+    {
+        HtmlTokenizer tokenizer(std::string("</ p>x"));
+        auto tokens = tokenizer.tokenize();
+        ASSERT_EQ(tokens.size(), (size_t)3);
+        EXPECT_TRUE(tokens[0].isComment());
+        EXPECT_STREQ(tokens[0].data.c_str(), " p");
+        EXPECT_STREQ(tokens[1].data.c_str(), "x");
+    }
+    {
+        HtmlTokenizer tokenizer(std::string("<?xml version=\"1.0\"?>"));
+        auto tokens = tokenizer.tokenize();
+        ASSERT_EQ(tokens.size(), (size_t)2);
+        EXPECT_STREQ(tokens[0].data.c_str(), "?xml version=\"1.0\"?");
+    }
+}
+
+TEST(Tokenizer_InputPreprocessing) {
+    // CRLF and lone CR become LF
+    auto result = HtmlParser::parseHtml("<p>a\r\nb\rc</p>");
+    EXPECT_STREQ(firstText(result.document, "p").c_str(), "a\nb\nc");
+
+    // NUL: dropped in data, U+FFFD elsewhere (never invalid UTF-8)
+    auto withNul = HtmlParser::parseHtml(std::string("<p title=\"x\0y\">a\0b</p>", 22));
+    EXPECT_STREQ(firstText(withNul.document, "p").c_str(), "ab");
+    EXPECT_TRUE(attr(withNul.document, "p", "title") == "x\xEF\xBF\xBDy");
+}
+
+TEST(Tokenizer_CdataWhenAllowed) {
+    HtmlTokenizer tokenizer(std::string("<![CDATA[x<y]]><p>z</p>"));
+    tokenizer.setAllowCdata(true);
+    auto tokens = tokenizer.tokenize();
+    ASSERT_EQ(tokens.size(), (size_t)5);
+    EXPECT_STREQ(tokens[0].data.c_str(), "x<y");
+    EXPECT_TRUE(tokens[1].isStartTag());
+    EXPECT_STREQ(tokens[2].data.c_str(), "z");
+}
+
+TEST(HtmlParser_SrcsetAndImportUrls) {
+    auto result = HtmlParser::parseHtml(
+        "<style>@import url(\"x.css\"); @import 'y.css';</style>"
+        "<img srcset=\"a.jpg, b.jpg 2x\"><img srcset=\"c.jpg 1x,d.jpg 2x\">");
+    auto links = HtmlParser::extractLinks(result.document);
+    auto has = [&](const std::string &url) {
+        return std::find(links.begin(), links.end(), url) != links.end();
+    };
+    EXPECT_TRUE(has("a.jpg"));
+    EXPECT_TRUE(has("b.jpg"));
+    EXPECT_TRUE(has("c.jpg"));
+    EXPECT_TRUE(has("d.jpg"));
+    EXPECT_FALSE(has("a.jpg,"));
+    EXPECT_FALSE(has("2x"));
+
+    auto sheets = HtmlParser::extractStylesheets(result.document);
+    EXPECT_TRUE(std::find(sheets.begin(), sheets.end(), "x.css") != sheets.end());
+    EXPECT_TRUE(std::find(sheets.begin(), sheets.end(), "y.css") != sheets.end());
 }

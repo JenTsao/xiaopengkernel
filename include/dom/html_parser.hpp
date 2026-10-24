@@ -205,17 +205,27 @@ public:
             pos++;
 
           if (pos < content.size()) {
+            // @import url("a.css") | url(a.css) | "a.css"
+            const bool urlFunction = toLower(content.substr(pos, 4)) == "url(";
+            if (urlFunction) {
+              pos += 4;
+              while (pos < content.size() && isWhitespace(content[pos]))
+                pos++;
+            }
+
             char quote = '\0';
-            if (content[pos] == '"' || content[pos] == '\'') {
+            if (pos < content.size() &&
+                (content[pos] == '"' || content[pos] == '\'')) {
               quote = content[pos];
               pos++;
             }
 
             size_t start = pos;
             while (pos < content.size()) {
-              if (quote && content[pos] == quote)
-                break;
-              if (!quote && (content[pos] == ';' || isWhitespace(content[pos])))
+              char c = content[pos];
+              if (quote ? c == quote
+                        : (c == ';' || isWhitespace(c) ||
+                           (urlFunction && c == ')')))
                 break;
               pos++;
             }
@@ -439,29 +449,45 @@ private:
     }
   }
 
+  // HTML "parse a srcset attribute": candidates are "URL [descriptors]"
+  // separated by commas; a URL may itself end with the separating comma
   static void extractSrcsetLinks(const std::string &srcset,
                                  std::vector<std::string> &links) {
+    const size_t n = srcset.size();
     size_t pos = 0;
-    while (pos < srcset.size()) {
-      while (pos < srcset.size() && isWhitespace(srcset[pos]))
+    while (pos < n) {
+      while (pos < n && (isWhitespace(srcset[pos]) || srcset[pos] == ','))
         pos++;
 
       size_t start = pos;
-      while (pos < srcset.size() && !isWhitespace(srcset[pos]))
+      while (pos < n && !isWhitespace(srcset[pos]))
         pos++;
 
-      if (start < pos) {
-        std::string url = srcset.substr(start, pos - start);
-        if (!url.empty() && url.find("data:") != 0) {
-          links.push_back(url);
-        }
+      std::string url = srcset.substr(start, pos - start);
+      bool endedWithComma = false;
+      while (!url.empty() && url.back() == ',') {
+        url.pop_back();
+        endedWithComma = true;
       }
+      if (!url.empty() && url.compare(0, 5, "data:") != 0) {
+        links.push_back(url);
+      }
+      if (endedWithComma)
+        continue;
 
-      while (pos < srcset.size() && isWhitespace(srcset[pos]))
+      // Skip descriptors ("2x", "100w") up to the next top-level comma
+      int depth = 0;
+      while (pos < n) {
+        char c = srcset[pos];
+        if (c == '(') {
+          depth++;
+        } else if (c == ')' && depth > 0) {
+          depth--;
+        } else if (c == ',' && depth == 0) {
+          break;
+        }
         pos++;
-
-      while (pos < srcset.size() && !isWhitespace(srcset[pos]))
-        pos++;
+      }
     }
   }
 

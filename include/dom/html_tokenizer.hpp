@@ -7,10 +7,14 @@
 #include <vector>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 
 namespace xiaopeng {
 namespace dom {
+
+// U+FFFD, substituted for NUL and invalid code points
+inline constexpr char kReplacementCharacter[] = "\xEF\xBF\xBD";
 
 enum class TokenizerState : uint8_t {
     Data,
@@ -133,10 +137,21 @@ private:
     void finishAttribute();
     
     bool isAppropriateEndTag() const;
+    void emitCurrentTagToken();
     
-    std::string consumeCharacterReference();
+    // inAttribute enables the WHATWG "historical" rule for references that
+    // lack a ';' and are followed by '=' or an alphanumeric
+    std::string consumeCharacterReference(bool inAttribute);
+    static bool isLegacyEntityName(const std::string& name);
     
     void handleDataState();
+    void handleRcdataState();
+    void handleRawtextState();
+    void handlePlaintextState();
+    void handleTextLessThanSignState(bool rcdata);
+    void handleTextEndTagOpenState(bool rcdata);
+    void handleTextEndTagNameState(bool rcdata);
+    void handleCdataSectionState();
     void handleTagOpenState();
     void handleEndTagOpenState();
     void handleTagNameState();
@@ -202,23 +217,50 @@ private:
     bool reconsume_ = false;
     bool allowCdata_ = false;
     
+    void normalizeNewlines();
     static std::unordered_map<std::string, std::string>& getNamedEntities();
 };
 
 inline HtmlTokenizer::HtmlTokenizer(std::string_view input)
     : input_(input) {
     currentToken_ = Token::makeEndOfFile();
+    if (input_.find('\r') != std::string_view::npos) {
+        ownedInput_.assign(input_.data(), input_.size());
+        normalizeNewlines();
+    }
 }
 
 inline HtmlTokenizer::HtmlTokenizer(const loader::ByteBuffer& input)
     : ownedInput_(reinterpret_cast<const char*>(input.data()), input.size()),
       input_(ownedInput_) {
     currentToken_ = Token::makeEndOfFile();
+    normalizeNewlines();
 }
 
 inline HtmlTokenizer::HtmlTokenizer(const std::string& input)
     : ownedInput_(input), input_(ownedInput_) {
     currentToken_ = Token::makeEndOfFile();
+    normalizeNewlines();
+}
+
+// Input stream preprocessing: CRLF and lone CR become LF
+inline void HtmlTokenizer::normalizeNewlines() {
+    if (ownedInput_.find('\r') != std::string::npos) {
+        std::string normalized;
+        normalized.reserve(ownedInput_.size());
+        for (size_t i = 0; i < ownedInput_.size(); ++i) {
+            char c = ownedInput_[i];
+            if (c == '\r') {
+                normalized += '\n';
+                if (i + 1 < ownedInput_.size() && ownedInput_[i + 1] == '\n')
+                    ++i;
+            } else {
+                normalized += c;
+            }
+        }
+        ownedInput_ = std::move(normalized);
+    }
+    input_ = ownedInput_;
 }
 
 inline char HtmlTokenizer::currentInputCharacter() const {
@@ -282,6 +324,9 @@ inline void HtmlTokenizer::emitEofToken() {
     if (!characterTokenBuffer_.empty()) {
         emitToken(Token::makeCharacter(characterTokenBuffer_));
         characterTokenBuffer_.clear();
+        // The next call must reach end-of-file instead of re-entering the
+        // state that hit EOF (which would flush its pending text forever)
+        state_ = TokenizerState::Data;
         return;
     }
     emitToken(Token::makeEndOfFile());
@@ -377,11 +422,60 @@ inline bool HtmlTokenizer::isAppropriateEndTag() const {
            toLower(currentToken_.name) == toLower(lastStartTag_);
 }
 
+// Emit the finished tag token. Start tags of raw-text elements switch the
+// tokenizer the way the tree builder would (the whole input is tokenized
+// before tree construction, so the builder cannot do it): their content up
+// to the matching end tag is text, never markup.
+inline void HtmlTokenizer::emitCurrentTagToken() {
+    state_ = TokenizerState::Data;
+    if (currentToken_.isStartTag()) {
+        lastStartTag_ = currentToken_.name;
+        const std::string& name = currentToken_.name;
+        if (name == "title" || name == "textarea") {
+            state_ = TokenizerState::Rcdata;
+        } else if (name == "style" || name == "script" || name == "xmp" ||
+                   name == "iframe" || name == "noembed" ||
+                   name == "noframes") {
+            state_ = TokenizerState::Rawtext;
+        } else if (name == "plaintext") {
+            state_ = TokenizerState::Plaintext;
+        }
+    }
+    emitToken(currentToken_);
+}
+
 inline Token HtmlTokenizer::nextToken() {
     while (!hasEmittedToken_) {
         switch (state_) {
             case TokenizerState::Data:
                 handleDataState();
+                break;
+            case TokenizerState::Rcdata:
+                handleRcdataState();
+                break;
+            case TokenizerState::Rawtext:
+                handleRawtextState();
+                break;
+            case TokenizerState::Plaintext:
+                handlePlaintextState();
+                break;
+            case TokenizerState::RcdataLessThanSign:
+            case TokenizerState::RawtextLessThanSign:
+                handleTextLessThanSignState(state_ ==
+                                            TokenizerState::RcdataLessThanSign);
+                break;
+            case TokenizerState::RcdataEndTagOpen:
+            case TokenizerState::RawtextEndTagOpen:
+                handleTextEndTagOpenState(state_ ==
+                                          TokenizerState::RcdataEndTagOpen);
+                break;
+            case TokenizerState::RcdataEndTagName:
+            case TokenizerState::RawtextEndTagName:
+                handleTextEndTagNameState(state_ ==
+                                          TokenizerState::RcdataEndTagName);
+                break;
+            case TokenizerState::CdataSection:
+                handleCdataSectionState();
                 break;
             case TokenizerState::TagOpen:
                 handleTagOpenState();
@@ -523,7 +617,7 @@ inline void HtmlTokenizer::handleDataState() {
     
     if (c == '&') {
         returnState_ = TokenizerState::Data;
-        std::string ref = consumeCharacterReference();
+        std::string ref = consumeCharacterReference(false);
         if (!ref.empty()) {
             if (characterTokenBuffer_.empty()) {
                 // Standalone entity: emit its own character token (existing
@@ -552,12 +646,180 @@ inline void HtmlTokenizer::handleDataState() {
     }
     
     if (c == '\0') {
+        // Tree construction ignores U+0000 in data, so drop it here
         emitError("Unexpected null character");
-        emitCharacterToken('\xFF');
         return;
     }
     
     emitCharacterToken(c);
+}
+
+// RCDATA (<title>, <textarea>): text with character references, no markup
+inline void HtmlTokenizer::handleRcdataState() {
+    char c = consumeCharWithReconsume();
+    
+    if (c == '\0' && position_ >= input_.size()) {
+        emitEofToken();
+        return;
+    }
+    
+    if (c == '&') {
+        std::string ref = consumeCharacterReference(false);
+        emitCharacterToken(ref.empty() ? std::string("&") : ref);
+        return;
+    }
+    
+    if (c == '<') {
+        state_ = TokenizerState::RcdataLessThanSign;
+        return;
+    }
+    
+    if (c == '\0') {
+        emitError("Unexpected null character");
+        emitCharacterToken(kReplacementCharacter);
+        return;
+    }
+    
+    emitCharacterToken(c);
+}
+
+// RAWTEXT (<style>, <script>, <xmp>, <iframe>, ...): text only
+inline void HtmlTokenizer::handleRawtextState() {
+    char c = consumeCharWithReconsume();
+    
+    if (c == '\0' && position_ >= input_.size()) {
+        emitEofToken();
+        return;
+    }
+    
+    if (c == '<') {
+        state_ = TokenizerState::RawtextLessThanSign;
+        return;
+    }
+    
+    if (c == '\0') {
+        emitError("Unexpected null character");
+        emitCharacterToken(kReplacementCharacter);
+        return;
+    }
+    
+    emitCharacterToken(c);
+}
+
+inline void HtmlTokenizer::handlePlaintextState() {
+    char c = consumeNextInputCharacter();
+    
+    if (c == '\0' && position_ >= input_.size()) {
+        emitEofToken();
+        return;
+    }
+    
+    if (c == '\0') {
+        emitError("Unexpected null character");
+        emitCharacterToken(kReplacementCharacter);
+        return;
+    }
+    
+    emitCharacterToken(c);
+}
+
+// Never set reconsume_ after reading EOF in the states below: nothing was
+// consumed then, so stepping back would re-read the previous character.
+inline void HtmlTokenizer::handleTextLessThanSignState(bool rcdata) {
+    char c = consumeCharWithReconsume();
+    
+    if (c == '/') {
+        tempBuffer_.clear();
+        state_ = rcdata ? TokenizerState::RcdataEndTagOpen
+                        : TokenizerState::RawtextEndTagOpen;
+        return;
+    }
+    
+    emitCharacterToken('<');
+    if (c == '\0' && position_ >= input_.size()) {
+        emitEofToken();
+        return;
+    }
+    reconsume_ = true;
+    state_ = rcdata ? TokenizerState::Rcdata : TokenizerState::Rawtext;
+}
+
+inline void HtmlTokenizer::handleTextEndTagOpenState(bool rcdata) {
+    char c = consumeCharWithReconsume();
+    
+    if (isAlpha(c)) {
+        createEndTagToken();
+        reconsume_ = true;
+        state_ = rcdata ? TokenizerState::RcdataEndTagName
+                        : TokenizerState::RawtextEndTagName;
+        return;
+    }
+    
+    emitCharacterToken("</");
+    if (c == '\0' && position_ >= input_.size()) {
+        emitEofToken();
+        return;
+    }
+    reconsume_ = true;
+    state_ = rcdata ? TokenizerState::Rcdata : TokenizerState::Rawtext;
+}
+
+inline void HtmlTokenizer::handleTextEndTagNameState(bool rcdata) {
+    char c = consumeCharWithReconsume();
+    const bool atEof = c == '\0' && position_ >= input_.size();
+    
+    if (!atEof && (isWhitespace(c) || c == '/' || c == '>') &&
+        isAppropriateEndTag()) {
+        // The text before the end tag goes out first. emitToken() has a
+        // single slot, so flush it now and see the terminator again next time.
+        if (!characterTokenBuffer_.empty()) {
+            emitToken(Token::makeCharacter(characterTokenBuffer_));
+            characterTokenBuffer_.clear();
+            reconsume_ = true;
+            return;
+        }
+        if (isWhitespace(c)) {
+            state_ = TokenizerState::BeforeAttributeName;
+        } else if (c == '/') {
+            state_ = TokenizerState::SelfClosingStartTag;
+        } else {
+            emitCurrentTagToken();
+        }
+        return;
+    }
+    
+    if (!atEof && isAlpha(c)) {
+        appendToTagName(toLower(c));
+        tempBuffer_ += c;
+        return;
+    }
+    
+    // Not the matching end tag: "</name" was just text
+    emitCharacterToken("</");
+    emitCharacterToken(tempBuffer_);
+    if (atEof) {
+        emitEofToken();
+        return;
+    }
+    reconsume_ = true;
+    state_ = rcdata ? TokenizerState::Rcdata : TokenizerState::Rawtext;
+}
+
+// <![CDATA[ ... ]]> (only entered when allowCdata_ is set)
+inline void HtmlTokenizer::handleCdataSectionState() {
+    if (position_ >= input_.size()) {
+        emitError("EOF in CDATA");
+        emitEofToken();
+        return;
+    }
+    if (input_.compare(position_, 3, "]]>") == 0) {
+        for (int i = 0; i < 3; ++i) {
+            consumeNextInputCharacter();
+        }
+        state_ = TokenizerState::Data;
+        return;
+    }
+    emitCharacterToken(consumeNextInputCharacter());
 }
 
 inline void HtmlTokenizer::handleTagOpenState() {
@@ -583,6 +845,7 @@ inline void HtmlTokenizer::handleTagOpenState() {
     if (c == '?') {
         emitError("Unexpected question mark instead of tag name");
         createCommentToken();
+        reconsume_ = true; // the '?' is part of the bogus comment's data
         state_ = TokenizerState::BogusComment;
         return;
     }
@@ -644,11 +907,7 @@ inline void HtmlTokenizer::handleTagNameState() {
     }
     
     if (c == '>') {
-        state_ = TokenizerState::Data;
-        if (currentToken_.isStartTag()) {
-            lastStartTag_ = currentToken_.name;
-        }
-        emitToken(currentToken_);
+        emitCurrentTagToken();
         return;
     }
     
@@ -660,7 +919,7 @@ inline void HtmlTokenizer::handleTagNameState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToTagName('\xFF');
+        currentToken_.name += kReplacementCharacter;
         return;
     }
     
@@ -699,7 +958,7 @@ inline void HtmlTokenizer::handleBeforeAttributeNameState() {
         appendToAttributeName(toLower(c));
     } else if (c == '\0') {
         emitError("Unexpected null character");
-        appendToAttributeName('\xFF');
+        currentAttributeName_ += kReplacementCharacter;
     } else {
         appendToAttributeName(c);
     }
@@ -728,7 +987,7 @@ inline void HtmlTokenizer::handleAttributeNameState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToAttributeName('\xFF');
+        currentAttributeName_ += kReplacementCharacter;
         return;
     }
     
@@ -763,11 +1022,7 @@ inline void HtmlTokenizer::handleAfterAttributeNameState() {
     
     if (c == '>') {
         finishAttribute();
-        state_ = TokenizerState::Data;
-        if (currentToken_.isStartTag()) {
-            lastStartTag_ = currentToken_.name;
-        }
-        emitToken(currentToken_);
+        emitCurrentTagToken();
         return;
     }
     
@@ -782,7 +1037,7 @@ inline void HtmlTokenizer::handleAfterAttributeNameState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToAttributeName('\xFF');
+        currentAttributeName_ += kReplacementCharacter;
     } else if (isAlpha(c)) {
         appendToAttributeName(toLower(c));
     } else {
@@ -811,11 +1066,7 @@ inline void HtmlTokenizer::handleBeforeAttributeValueState() {
     if (c == '>') {
         emitError("Missing attribute value");
         finishAttribute();
-        state_ = TokenizerState::Data;
-        if (currentToken_.isStartTag()) {
-            lastStartTag_ = currentToken_.name;
-        }
-        emitToken(currentToken_);
+        emitCurrentTagToken();
         return;
     }
     
@@ -847,12 +1098,12 @@ inline void HtmlTokenizer::handleAttributeValueDoubleQuotedState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToAttributeValue('\xFF');
+        currentAttributeValue_ += kReplacementCharacter;
         return;
     }
     
     if (c == '&') {
-        std::string ref = consumeCharacterReference();
+        std::string ref = consumeCharacterReference(true);
         if (!ref.empty()) {
             currentAttributeValue_ += ref;
             return;
@@ -879,12 +1130,12 @@ inline void HtmlTokenizer::handleAttributeValueSingleQuotedState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToAttributeValue('\xFF');
+        currentAttributeValue_ += kReplacementCharacter;
         return;
     }
     
     if (c == '&') {
-        std::string ref = consumeCharacterReference();
+        std::string ref = consumeCharacterReference(true);
         if (!ref.empty()) {
             currentAttributeValue_ += ref;
             return;
@@ -905,11 +1156,7 @@ inline void HtmlTokenizer::handleAttributeValueUnquotedState() {
     
     if (c == '>') {
         finishAttribute();
-        state_ = TokenizerState::Data;
-        if (currentToken_.isStartTag()) {
-            lastStartTag_ = currentToken_.name;
-        }
-        emitToken(currentToken_);
+        emitCurrentTagToken();
         return;
     }
     
@@ -921,7 +1168,7 @@ inline void HtmlTokenizer::handleAttributeValueUnquotedState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToAttributeValue('\xFF');
+        currentAttributeValue_ += kReplacementCharacter;
         return;
     }
     
@@ -930,7 +1177,7 @@ inline void HtmlTokenizer::handleAttributeValueUnquotedState() {
     }
     
     if (c == '&') {
-        std::string ref = consumeCharacterReference();
+        std::string ref = consumeCharacterReference(true);
         if (!ref.empty()) {
             currentAttributeValue_ += ref;
             return;
@@ -954,11 +1201,7 @@ inline void HtmlTokenizer::handleAfterAttributeValueQuotedState() {
     }
     
     if (c == '>') {
-        state_ = TokenizerState::Data;
-        if (currentToken_.isStartTag()) {
-            lastStartTag_ = currentToken_.name;
-        }
-        emitToken(currentToken_);
+        emitCurrentTagToken();
         return;
     }
     
@@ -978,11 +1221,7 @@ inline void HtmlTokenizer::handleSelfClosingStartTagState() {
     
     if (c == '>') {
         currentToken_.selfClosing = true;
-        state_ = TokenizerState::Data;
-        if (currentToken_.isStartTag()) {
-            lastStartTag_ = currentToken_.name;
-        }
-        emitToken(currentToken_);
+        emitCurrentTagToken();
         return;
     }
     
@@ -1112,7 +1351,7 @@ inline void HtmlTokenizer::handleCommentState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToCommentData('\xFF');
+        currentToken_.data += kReplacementCharacter;
         return;
     }
     
@@ -1203,7 +1442,8 @@ inline void HtmlTokenizer::handleCommentEndBangState() {
 }
 
 inline void HtmlTokenizer::handleBogusCommentState() {
-    char c = consumeNextInputCharacter();
+    // Entered with reconsume_ set (from </ and <?), so honour it
+    char c = consumeCharWithReconsume();
     
     if (c == '>') {
         state_ = TokenizerState::Data;
@@ -1218,7 +1458,7 @@ inline void HtmlTokenizer::handleBogusCommentState() {
     }
     
     if (c == '\0') {
-        appendToCommentData('\xFF');
+        currentToken_.data += kReplacementCharacter;
         return;
     }
     
@@ -1281,7 +1521,7 @@ inline void HtmlTokenizer::handleBeforeDoctypeNameState() {
     createDoctypeToken();
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToTagName('\xFF');
+        currentToken_.name += kReplacementCharacter;
     } else if (isAlpha(c)) {
         appendToTagName(toLower(c));
     } else {
@@ -1314,7 +1554,7 @@ inline void HtmlTokenizer::handleDoctypeNameState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToTagName('\xFF');
+        currentToken_.name += kReplacementCharacter;
         return;
     }
     
@@ -1482,7 +1722,7 @@ inline void HtmlTokenizer::handleDoctypePublicIdentifierDoubleQuotedState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToPublicIdentifier('\xFF');
+        currentToken_.publicIdentifier += kReplacementCharacter;
         return;
     }
     
@@ -1515,7 +1755,7 @@ inline void HtmlTokenizer::handleDoctypePublicIdentifierSingleQuotedState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToPublicIdentifier('\xFF');
+        currentToken_.publicIdentifier += kReplacementCharacter;
         return;
     }
     
@@ -1702,7 +1942,7 @@ inline void HtmlTokenizer::handleDoctypeSystemIdentifierDoubleQuotedState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToSystemIdentifier('\xFF');
+        currentToken_.systemIdentifier += kReplacementCharacter;
         return;
     }
     
@@ -1735,7 +1975,7 @@ inline void HtmlTokenizer::handleDoctypeSystemIdentifierSingleQuotedState() {
     
     if (c == '\0') {
         emitError("Unexpected null character");
-        appendToSystemIdentifier('\xFF');
+        currentToken_.systemIdentifier += kReplacementCharacter;
         return;
     }
     
@@ -1783,69 +2023,53 @@ inline void HtmlTokenizer::handleBogusDoctypeState() {
     }
 }
 
-inline std::string HtmlTokenizer::consumeCharacterReference() {
-    if (position_ >= input_.size()) {
+inline std::string HtmlTokenizer::consumeCharacterReference(bool inAttribute) {
+    // Called just after '&'. On success the reference (and its ';') is
+    // consumed and the decoded text returned. Otherwise "" is returned and
+    // NOTHING is consumed, so the caller emits '&' and the following
+    // characters are tokenized normally ("AT&T", "a &- b", "&#;").
+    auto consumeUpTo = [this](size_t end) {
+        while (position_ < end) {
+            consumeNextInputCharacter();
+        }
+    };
+    const size_t size = input_.size();
+    if (position_ >= size) {
         return "";
     }
     
-    char c = input_[position_];
-    
-    if (isWhitespace(c) || c == '<' || c == '&' || c == '\0') {
-        return "";
-    }
-    
-    consumeNextInputCharacter();
-    
-    if (c == '#') {
-        int code = 0;
-        bool valid = false;
-        
-        if (position_ < input_.size()) {
-            char next = input_[position_];
-            if (next == 'x' || next == 'X') {
-                consumeNextInputCharacter();
-                while (position_ < input_.size()) {
-                    char hex = input_[position_];
-                    if (isHexDigit(hex)) {
-                        code *= 16;
-                        if (isDigit(hex)) {
-                            code += hex - '0';
-                        } else if (hex >= 'a' && hex <= 'f') {
-                            code += hex - 'a' + 10;
-                        } else {
-                            code += hex - 'A' + 10;
-                        }
-                        valid = true;
-                        consumeNextInputCharacter();
-                    } else {
-                        break;
-                    }
-                }
-            } else {
-                while (position_ < input_.size()) {
-                    char dec = input_[position_];
-                    if (isDigit(dec)) {
-                        code *= 10;
-                        code += dec - '0';
-                        valid = true;
-                        consumeNextInputCharacter();
-                    } else {
-                        break;
-                    }
-                }
+    if (input_[position_] == '#') {
+        size_t p = position_ + 1;
+        const bool hex = p < size && (input_[p] == 'x' || input_[p] == 'X');
+        if (hex) {
+            ++p;
+        }
+        // Accumulate with saturation: anything above U+10FFFF maps to
+        // U+FFFD, and long digit runs must not overflow
+        uint32_t code = 0;
+        bool anyDigit = false;
+        while (p < size && (hex ? isHexDigit(input_[p]) : isDigit(input_[p]))) {
+            char d = input_[p];
+            uint32_t digit = isDigit(d) ? static_cast<uint32_t>(d - '0')
+                                        : static_cast<uint32_t>(toLower(d) - 'a' + 10);
+            if (code <= 0x10FFFF) {
+                code = code * (hex ? 16 : 10) + digit;
             }
+            anyDigit = true;
+            ++p;
         }
         
-        if (!valid) {
+        if (!anyDigit) {
             emitError("Missing digits in numeric character reference");
             return "";
         }
         
-        if (position_ < input_.size() && input_[position_] == ';') {
-            consumeNextInputCharacter();
+        if (p < size && input_[p] == ';') {
+            ++p;
         } else {
             emitError("Missing semicolon after numeric character reference");
         }
+        consumeUpTo(p);
         
         if (code == 0) {
             emitError("Null character reference");
@@ -1853,20 +2077,22 @@ inline std::string HtmlTokenizer::consumeCharacterReference() {
         } else if (code > 0x10FFFF) {
             emitError("Character reference outside unicode range");
             code = 0xFFFD;
-        } else if ((code >= 0xD800 && code <= 0xDFFF) || code == 0xFFFE || code == 0xFFFF) {
+        } else if (code >= 0xD800 && code <= 0xDFFF) {
             emitError("Surrogate character reference");
             code = 0xFFFD;
         } else if (code >= 0x80 && code <= 0x9F) {
-            // WHATWG: numeric references to C1 controls map to
-            // windows-1252 glyphs (or U+FFFD where undefined)
+            // WHATWG: C1 controls with a windows-1252 glyph are remapped;
+            // the five undefined ones (0x81 0x8D 0x8F 0x90 0x9D) are kept
             emitError("C1 control character reference");
-            static const int kC1Remap[32] = {
-                0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020,
-                0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0xFFFD,
-                0x017D, 0xFFFD, 0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D,
+            static const uint32_t kC1Remap[32] = {
+                0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020,
+                0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0,
+                0x017D, 0, 0, 0x2018, 0x2019, 0x201C, 0x201D,
                 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A,
-                0x0153, 0xFFFD, 0x017E, 0x0178};
-            code = kC1Remap[code - 0x80];
+                0x0153, 0, 0x017E, 0x0178};
+            if (kC1Remap[code - 0x80] != 0) {
+                code = kC1Remap[code - 0x80];
+            }
         }
         
         std::string result;
@@ -1889,35 +2115,68 @@ inline std::string HtmlTokenizer::consumeCharacterReference() {
         return result;
     }
     
-    std::string entityName(1, c);
-    size_t runStart = position_;
-    while (position_ < input_.size()) {
-        char next = input_[position_];
-        if (isAlphanumeric(next)) {
-            entityName += next;
-            consumeNextInputCharacter();
-        } else {
-            break;
-        }
+    size_t runEnd = position_;
+    while (runEnd < size && isAlphanumeric(input_[runEnd])) {
+        ++runEnd;
     }
-
+    if (runEnd == position_) {
+        return "";
+    }
+    const std::string run(input_.substr(position_, runEnd - position_));
+    const bool runHasSemicolon = runEnd < size && input_[runEnd] == ';';
+    
     auto& entities = getNamedEntities();
     // Longest match: try the full alphanumeric run, then shorter prefixes
     // (so "&ampx" resolves "&amp" and leaves "x" in the data stream)
-    for (size_t len = entityName.size(); len >= 1; --len) {
-        auto it = entities.find(entityName.substr(0, len));
+    for (size_t len = run.size(); len >= 1; --len) {
+        const std::string name = run.substr(0, len);
+        auto it = entities.find(name);
         if (it == entities.end()) {
             continue;
         }
-        // Rewind the input to just after the matched name
-        position_ = runStart + len - 1;
-        if (position_ < input_.size() && input_[position_] == ';') {
-            consumeNextInputCharacter();
+        const bool semicolon = len == run.size() && runHasSemicolon;
+        if (!semicolon) {
+            // Only the legacy (HTML 4) names may omit the ';'
+            if (!isLegacyEntityName(name)) {
+                continue;
+            }
+            // Historical rule: in attribute values "&copy=2" or "&ampx"
+            // stay literal text (common in URLs)
+            if (inAttribute) {
+                size_t next = position_ + len;
+                if (next < size &&
+                    (input_[next] == '=' || isAlphanumeric(input_[next]))) {
+                    return "";
+                }
+            }
+            emitError("Missing semicolon after character reference");
         }
+        consumeUpTo(position_ + len + (semicolon ? 1 : 0));
         return it->second;
     }
-
+    
     return "";
+}
+
+// Named references that may appear without a trailing ';' (WHATWG table)
+inline bool HtmlTokenizer::isLegacyEntityName(const std::string& name) {
+    static const std::unordered_set<std::string> kLegacy = {
+        "AElig", "AMP", "Aacute", "Acirc", "Agrave", "Aring", "Atilde",
+        "Auml", "COPY", "Ccedil", "ETH", "Eacute", "Ecirc", "Egrave", "Euml",
+        "GT", "Iacute", "Icirc", "Igrave", "Iuml", "LT", "Ntilde", "Oacute",
+        "Ocirc", "Ograve", "Oslash", "Otilde", "Ouml", "QUOT", "REG", "THORN",
+        "Uacute", "Ucirc", "Ugrave", "Uuml", "Yacute", "aacute", "acirc",
+        "acute", "aelig", "agrave", "amp", "aring", "atilde", "auml",
+        "brvbar", "ccedil", "cedil", "cent", "copy", "curren", "deg",
+        "divide", "eacute", "ecirc", "egrave", "eth", "euml", "frac12",
+        "frac14", "frac34", "gt", "iacute", "icirc", "iexcl", "igrave",
+        "iquest", "iuml", "laquo", "lt", "macr", "micro", "middot", "nbsp",
+        "not", "ntilde", "oacute", "ocirc", "ograve", "ordf", "ordm",
+        "oslash", "otilde", "ouml", "para", "plusmn", "pound", "quot",
+        "raquo", "reg", "sect", "shy", "sup1", "sup2", "sup3", "szlig",
+        "thorn", "times", "uacute", "ucirc", "ugrave", "uml", "uuml",
+        "yacute", "yen", "yuml"};
+    return kLegacy.count(name) > 0;
 }
 
 inline std::unordered_map<std::string, std::string>& HtmlTokenizer::getNamedEntities() {
