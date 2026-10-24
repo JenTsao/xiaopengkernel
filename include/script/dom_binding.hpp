@@ -586,7 +586,7 @@ public:
     // Comment, ProcessingInstruction etc. → generic object with nodeType
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "nodeType",
-                      JS_NewInt32(ctx, static_cast<int>(node->nodeType())));
+                      JS_NewInt32(ctx, domNodeTypeNumber(node->nodeType())));
     JS_SetPropertyStr(ctx, obj, "nodeName",
                       JSBinding::toJSString(ctx, node->nodeName()));
     if (node->nodeType() == dom::NodeType::Comment) {
@@ -1131,13 +1131,37 @@ public:
     return JS_UNDEFINED;
   }
 
+  // DOM Node.nodeType constants; the C++ enum is just an ordinal
+  // (Element = 0, Text = 1, ...)
+  static int domNodeTypeNumber(dom::NodeType type) {
+    switch (type) {
+    case dom::NodeType::Element:
+      return 1;
+    case dom::NodeType::Text:
+      return 3;
+    case dom::NodeType::CdataSection:
+      return 4;
+    case dom::NodeType::ProcessingInstruction:
+      return 7;
+    case dom::NodeType::Comment:
+      return 8;
+    case dom::NodeType::Document:
+      return 9;
+    case dom::NodeType::DocumentType:
+      return 10;
+    case dom::NodeType::DocumentFragment:
+      return 11;
+    }
+    return 0;
+  }
+
   // node.nodeType
   static JSValue node_get_nodeType(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv) {
     (void)argc; (void)argv;
     dom::Node *node = getNodeFromThis(ctx, this_val);
     if (!node) return JS_EXCEPTION;
-    return JS_NewInt32(ctx, static_cast<int>(node->nodeType()));
+    return JS_NewInt32(ctx, domNodeTypeNumber(node->nodeType()));
   }
 
   // ══════════════════════════════════════════════════════════
