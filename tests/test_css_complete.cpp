@@ -526,6 +526,317 @@ TEST(VarFallback) {
   EXPECT_TRUE(style.color.r == 0);
 }
 
+// ── Regression: parser / tokenizer ───────────────────────────
+
+namespace {
+
+bool matches(const ElementPtr &el, const std::string &selector) {
+  StyleResolver resolver;
+  for (const auto &sel : CssParser::parseSelectorList(selector)) {
+    if (resolver.matchSelector(el, sel))
+      return true;
+  }
+  return false;
+}
+
+} // namespace
+
+TEST(Tokenizer_PlusBeforeLetterTerminates) {
+  // '+' followed by a name start used to return a Delim without consuming
+  // it, so tokenize() never ended on selectors like h1+p
+  auto doc = std::make_shared<Document>();
+  auto body = doc->createElement("body");
+  auto h1 = doc->createElement("h1");
+  auto p = doc->createElement("p");
+  body->appendChild(h1);
+  body->appendChild(p);
+  doc->appendChild(body);
+
+  auto sheet = parseSheet("h1+p { color: red; }");
+  ASSERT_EQ(sheet.rules.size(), (size_t)1);
+  StyleResolver resolver;
+  EXPECT_TRUE(resolver.resolveStyle(p, sheet, nullptr).color.r == 255);
+  EXPECT_TRUE(resolver.resolveStyle(h1, sheet, nullptr).color.r == 0);
+}
+
+TEST(Declaration_TrailingWhitespaceAndImportant) {
+  Tree t;
+  {
+    // no ';' before '}' — the value must still be the bare keyword
+    auto sheet = parseSheet("p { display: none }");
+    ASSERT_EQ(sheet.rules.size(), (size_t)1);
+    EXPECT_STREQ(sheet.rules[0].declarations[0].value.c_str(), "none");
+    StyleResolver resolver;
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).display ==
+                Display::None);
+  }
+  {
+    auto sheet = parseSheet("p { float: left !important; } p { float: right; }");
+    StyleResolver resolver;
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.cssFloat == Float::Left);
+  }
+  {
+    // whitespace inside "! important" and keyword case are allowed
+    auto sheet = parseSheet("p { display: block ! IMPORTANT; } p { display: none; }");
+    ASSERT_EQ(sheet.rules.size(), (size_t)2);
+    EXPECT_TRUE(sheet.rules[0].declarations[0].important);
+    StyleResolver resolver;
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).display ==
+                Display::Block);
+  }
+}
+
+TEST(AtRules_DoNotSwallowFollowingRules) {
+  Tree t;
+  StyleResolver resolver;
+  {
+    auto sheet = parseSheet("@import url(base.css); p { color: red; }");
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).color.r == 255);
+  }
+  {
+    // the nested rule must not leak out of the skipped @media block
+    auto sheet = parseSheet(
+        "@media print { .text { color: blue; } p { color: blue; } } "
+        "p { color: red; }");
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.color.r == 255);
+    EXPECT_TRUE(style.color.b == 0);
+  }
+  {
+    auto sheet = parseSheet("<!-- p { color: red; } -->");
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).color.r == 255);
+  }
+}
+
+TEST(UnquotedUrl_KeepsWholeUrl) {
+  Tree t;
+  auto sheet = parseSheet(
+      "p { background: url(/img/a.png); } "
+      "div { background: url(data:image/png;base64,AAAA); }");
+  StyleResolver resolver;
+  auto pStyle = resolver.resolveStyle(t.p, sheet, nullptr);
+  auto divStyle = resolver.resolveStyle(t.div, sheet, nullptr);
+  EXPECT_STREQ(pStyle.otherProperties.at("background").c_str(),
+               "url(/img/a.png)");
+  EXPECT_STREQ(divStyle.otherProperties.at("background").c_str(),
+               "url(data:image/png;base64,AAAA)");
+}
+
+// ── Regression: structural pseudo-classes ────────────────────
+
+TEST(NthChild_AnPlusB) {
+  auto doc = std::make_shared<Document>();
+  auto ul = doc->createElement("ul");
+  std::vector<ElementPtr> li;
+  for (int i = 0; i < 6; ++i) {
+    li.push_back(doc->createElement("li"));
+    ul->appendChild(li.back());
+  }
+  doc->appendChild(ul);
+
+  // 2n+1 must keep its sign through tokenization: 1st, 3rd, 5th
+  EXPECT_TRUE(matches(li[0], "li:nth-child(2n+1)"));
+  EXPECT_FALSE(matches(li[1], "li:nth-child(2n+1)"));
+  EXPECT_TRUE(matches(li[4], "li:nth-child(2n + 1)"));
+  // negative step: first three only
+  EXPECT_TRUE(matches(li[0], "li:nth-child(-n+3)"));
+  EXPECT_TRUE(matches(li[2], "li:nth-child(-n+3)"));
+  EXPECT_FALSE(matches(li[3], "li:nth-child(-n+3)"));
+  EXPECT_TRUE(matches(li[1], "li:nth-child(even)"));
+  EXPECT_FALSE(matches(li[1], "li:nth-child(-n)"));
+  // :nth-last-child never matched before
+  EXPECT_TRUE(matches(li[5], "li:nth-last-child(1)"));
+  EXPECT_TRUE(matches(li[4], "li:nth-last-child(-n+2)"));
+  EXPECT_FALSE(matches(li[3], "li:nth-last-child(-n+2)"));
+  // :nth-last-of-type accepts An+B too
+  EXPECT_TRUE(matches(li[3], "li:nth-last-of-type(2n+1)"));
+  EXPECT_FALSE(matches(li[4], "li:nth-last-of-type(2n+1)"));
+}
+
+TEST(FirstChild_IgnoresWhitespaceText) {
+  auto doc = std::make_shared<Document>();
+  auto div = doc->createElement("div");
+  auto p1 = doc->createElement("p");
+  auto p2 = doc->createElement("p");
+  auto empty = doc->createElement("span");
+  div->appendChild(doc->createTextNode("\n  "));
+  div->appendChild(p1);
+  div->appendChild(doc->createTextNode("\n  "));
+  div->appendChild(p2);
+  div->appendChild(doc->createTextNode("\n"));
+  empty->appendChild(doc->createComment("note"));
+  p2->appendChild(empty);
+  doc->appendChild(div);
+
+  EXPECT_TRUE(matches(p1, "p:first-child"));
+  EXPECT_FALSE(matches(p2, "p:first-child"));
+  EXPECT_TRUE(matches(p2, "p:last-child"));
+  // comments do not make an element non-empty
+  EXPECT_TRUE(matches(empty, "span:empty"));
+  EXPECT_FALSE(matches(p2, "p:empty"));
+}
+
+TEST(NotPseudo_UsesSelectorEngine) {
+  auto doc = std::make_shared<Document>();
+  auto div = doc->createElement("div");
+  auto p1 = doc->createElement("p");
+  auto p2 = doc->createElement("p");
+  p1->setClassName("a b");
+  p1->setAttribute("title", "a b");
+  p2->setClassName("a");
+  div->appendChild(p1);
+  div->appendChild(p2);
+  doc->appendChild(div);
+
+  EXPECT_FALSE(matches(p1, "p:not(.a.b)"));
+  EXPECT_TRUE(matches(p2, "p:not(.a.b)"));
+  EXPECT_FALSE(matches(p1, "p:not(:first-child)"));
+  EXPECT_TRUE(matches(p2, "p:not(:first-child)"));
+  EXPECT_FALSE(matches(p2, "p:not(.x, .a)"));
+  EXPECT_FALSE(matches(p1, "p:not([title=\"a b\"])"));
+  EXPECT_TRUE(matches(p2, "p:not([title=\"a b\"])"));
+  EXPECT_FALSE(matches(p1, "p:not(:nth-child(1))"));
+
+  // :not() weighs its most specific argument
+  auto sel = CssParser::parseSelectorList(":not(#x)");
+  ASSERT_EQ(sel.size(), (size_t)1);
+  Specificity s = sel[0].specificity();
+  EXPECT_TRUE(s.a == 1 && s.b == 0 && s.c == 0);
+}
+
+TEST(PseudoElement_DoesNotStyleOriginatingElement) {
+  Tree t;
+  auto sheet = parseSheet("p::before { color: red; display: none; }");
+  StyleResolver resolver;
+  auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+  EXPECT_TRUE(style.color.r == 0);
+  EXPECT_FALSE(style.display == Display::None);
+}
+
+TEST(AttributeSelector_EmptyValueNeverMatches) {
+  Tree t;
+  t.p->setAttribute("title", "hello");
+  EXPECT_FALSE(matches(t.p, "[title^=\"\"]"));
+  EXPECT_FALSE(matches(t.p, "[title$=\"\"]"));
+  EXPECT_FALSE(matches(t.p, "[title*=\"\"]"));
+  EXPECT_FALSE(matches(t.p, "[title~=\"\"]"));
+  EXPECT_TRUE(matches(t.p, "[title^=\"he\"]"));
+}
+
+// ── Regression: custom properties ────────────────────────────
+
+TEST(CustomProperties_CascadeBeforeUse) {
+  Tree t;
+  StyleResolver resolver;
+  {
+    // the variable comes from a more specific rule applied later
+    auto sheet = parseSheet(".text { color: var(--c); } #target { --c: #ff0000; }");
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).color.r == 255);
+  }
+  {
+    // used before it is declared in the same rule
+    auto sheet = parseSheet("p { color: var(--c); --c: #0000ff; }");
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).color.b == 255);
+  }
+  {
+    // variables referring to each other, declared out of order
+    auto sheet = parseSheet("p { --b: var(--a); --a: #00ff00; color: var(--b); }");
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).color.g == 255);
+  }
+}
+
+TEST(CustomProperties_SubstituteVerbatim) {
+  Tree t;
+  StyleResolver resolver;
+  {
+    auto sheet = parseSheet("p { --b: 3px solid #ff0000; border: var(--b); }");
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.borderTopWidth.value == 3.0f);
+    EXPECT_TRUE(style.borderTopColor.r == 255);
+  }
+  {
+    auto sheet = parseSheet("p { --gap: 2rem; margin-top: var(--gap); }");
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).marginTop.value ==
+                32.0f);
+  }
+  {
+    auto sheet = parseSheet("p { --c: rgba(255, 0, 0, 0.5); color: var(--c); }");
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.color.r == 255);
+    EXPECT_TRUE(style.color.a < 255);
+  }
+}
+
+TEST(VarFallback_NestedFunctionAndWhitespace) {
+  Tree t;
+  StyleResolver resolver;
+  {
+    auto sheet = parseSheet("p { color: var(--missing, rgb(0, 255, 0)); }");
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).color.g == 255);
+  }
+  {
+    // defined variable: the fallback's own ')' must not leak into the value
+    auto sheet = parseSheet("p { --c: #0000ff; color: var(--c, rgb(255, 0, 0)); }");
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.color.b == 255);
+    EXPECT_TRUE(style.color.r == 0);
+  }
+  {
+    auto sheet = parseSheet("p { font-family: var(--f, Times New Roman); }");
+    EXPECT_STREQ(resolver.resolveStyle(t.p, sheet, nullptr).fontFamily.c_str(),
+                 "Times New Roman");
+  }
+}
+
+TEST(VarUnresolvable_ActsAsUnset) {
+  Tree t;
+  auto sheet = parseSheet("body { color: red; } p { color: var(--nope); }");
+  StyleResolver resolver;
+  auto bodyStyle = resolver.resolveStyle(t.body, sheet, nullptr);
+  auto pStyle = resolver.resolveStyle(t.p, sheet, &bodyStyle);
+  // invalid at computed-value time → unset → inherited
+  EXPECT_TRUE(pStyle.color.r == 255);
+}
+
+// ── Regression: shorthands ───────────────────────────────────
+
+TEST(Shorthands_FlexBorderGapOpacity) {
+  Tree t;
+  StyleResolver resolver;
+  {
+    auto sheet = parseSheet("p { flex: 100px; }");
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.flexGrow == 1.0f);
+    EXPECT_TRUE(style.flexShrink == 1.0f);
+    EXPECT_TRUE(style.flexBasis.unit == Length::Unit::Px);
+    EXPECT_TRUE(style.flexBasis.value == 100.0f);
+  }
+  {
+    auto sheet = parseSheet("p { border: 2px solid red; } p { border: none; }");
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.borderTopWidth.value == 0.0f);
+    EXPECT_TRUE(style.borderLeftWidth.value == 0.0f);
+  }
+  {
+    auto sheet = parseSheet("p { border: 1px solid rgb(0, 0, 255); }");
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.borderTopColor.b == 255);
+    EXPECT_TRUE(style.borderTopWidth.value == 1.0f);
+  }
+  {
+    auto sheet = parseSheet("p { gap: 10px 20px; }");
+    auto style = resolver.resolveStyle(t.p, sheet, nullptr);
+    EXPECT_TRUE(style.gridRowGap.value == 10.0f);
+    EXPECT_TRUE(style.gridColumnGap.value == 20.0f);
+  }
+  {
+    auto sheet = parseSheet("p { opacity: 50%; } div { opacity: 2; }");
+    EXPECT_TRUE(resolver.resolveStyle(t.p, sheet, nullptr).opacity == 0.5f);
+    EXPECT_TRUE(resolver.resolveStyle(t.div, sheet, nullptr).opacity == 1.0f);
+  }
+}
+
 int main() {
   return xiaopeng::test::runTests();
 }

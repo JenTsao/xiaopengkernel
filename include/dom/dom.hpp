@@ -269,23 +269,25 @@ public:
 
   std::string outerHTML() const { return toHtml(); }
 
-  // Pseudo-class support methods
-  bool isFirstChild() const {
-    auto prev = previousSibling();
-    return !prev;
-  }
+  // Pseudo-class support methods. Only element siblings count: the
+  // whitespace text between tags must not hide a :first-child.
+  bool isFirstChild() const { return !previousElementSibling(); }
 
-  bool isLastChild() const {
-    auto next = nextSibling();
-    return !next;
-  }
+  bool isLastChild() const { return !nextElementSibling(); }
 
   bool isOnlyChild() const {
     return isFirstChild() && isLastChild();
   }
 
+  // :empty ignores comments and zero-length text (Selectors §14.2)
   bool isEmpty() const {
-    return childNodes_.empty();
+    for (const auto &child : childNodes_) {
+      if (child->nodeType() == NodeType::Element)
+        return false;
+      if (child->nodeType() == NodeType::Text && !child->textContent().empty())
+        return false;
+    }
+    return true;
   }
 
   bool isDocumentRoot() const {

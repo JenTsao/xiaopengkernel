@@ -45,6 +45,7 @@ struct Token {
   double numberValue = 0.0; // For Number, Percentage, Dimension
   bool flag = false; // "type flag" e.g. for Hash (id vs unrestricted), Number
                      // (integer vs number)
+  std::string repr{}; // Source text of numeric tokens (keeps the '+' sign)
 
   bool is(TokenType t) const { return type == t; }
 

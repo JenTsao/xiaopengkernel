@@ -247,6 +247,13 @@ private:
   }
 
   Token consumeNumeric() {
+    const size_t start = position_;
+    Token token = consumeNumericValue();
+    token.repr = input_.substr(start, position_ - start);
+    return token;
+  }
+
+  Token consumeNumericValue() {
     std::string buffer;
     buffer.reserve(16);
 
@@ -327,27 +334,63 @@ private:
     return token;
   }
 
+  // Unquoted url(...) per CSS Syntax §4.3.6: everything up to ')' is the URL
+  // (paths like /a.png or data:...;base64 must not be split into tokens)
+  Token consumeUrl() {
+    std::string value;
+    while (position_ < length_) {
+      char c = consume();
+      if (c == ')')
+        return {TokenType::Url, value};
+      if (isWhitespace(c)) {
+        consumeWhitespace();
+        if (position_ >= length_)
+          return {TokenType::Url, value};
+        if (peek() == ')') {
+          consume();
+          return {TokenType::Url, value};
+        }
+        return consumeBadUrlRemnants();
+      }
+      if (c == '"' || c == '\'' || c == '(')
+        return consumeBadUrlRemnants();
+      if (c == '\\') {
+        uint32_t decoded = decodeEscape();
+        if (decoded != 0)
+          appendUtf8(value, decoded);
+        continue;
+      }
+      value += c;
+    }
+    return {TokenType::Url, value};
+  }
+
+  Token consumeBadUrlRemnants() {
+    while (position_ < length_) {
+      char c = consume();
+      if (c == ')')
+        break;
+      if (c == '\\' && position_ < length_)
+        consume();
+    }
+    return {TokenType::BadUrl};
+  }
+
   Token consumeIdentLike() {
     std::string name = consumeName();
 
+    // Always advance: returning without consuming would make tokenize() spin
     if (name.empty())
-      return {TokenType::Delim, std::string(1, peek())};
+      return {TokenType::Delim, std::string(1, consume())};
 
     if (peek() == '(') {
       consume();
 
-      if (name == "url" && !name.empty()) {
+      if (name == "url") {
         consumeWhitespace();
-        if (position_ < length_) {
-          char c = peek();
-          if (c == '"' || c == '\'') {
-            return {TokenType::Function, name};
-          }
-          if (c == '#' || isNameStart(c) || c == '-' || c == '_') {
-            return {TokenType::Function, name};
-          }
-        }
-        return {TokenType::Url, ""};
+        if (peek() == '"' || peek() == '\'')
+          return {TokenType::Function, name};
+        return consumeUrl();
       }
 
       return {TokenType::Function, name};
@@ -463,9 +506,6 @@ private:
       if (isDigit(peekNext()) ||
           (peekNext() == '.' && isDigit(peek(2)))) {
         return consumeNumeric();
-      }
-      if (isNameStart(peekNext())) {
-        return consumeIdentLike();
       }
       consume();
       return {TokenType::Delim, "+"};

@@ -73,6 +73,10 @@ public:
       }
     }
 
+    // Custom properties cascade before anything else so every var()
+    // reference sees the winning value, whichever rule declares it
+    applyCustomProperties(style, matches, parentStyle);
+
     // 3. Apply non-important declarations first (sorted by specificity)
     for (const auto &match : matches) {
       applyDeclarations(style, match.rule->declarations, false, parentStyle);
@@ -217,6 +221,10 @@ private:
         if (op == "=")
           return val.value() == attrVal;
         if (op == "~=") {
+          // A value that is empty or contains whitespace never matches
+          if (attrVal.empty() ||
+              attrVal.find_first_of(" \t\n\r\f") != std::string::npos)
+            return false;
           std::string haystack = val.value();
           size_t pos = 0;
           while (pos < haystack.size()) {
@@ -234,325 +242,210 @@ private:
                   v.substr(0, attrVal.size()) == attrVal &&
                   v[attrVal.size()] == '-');
         }
+        // ^= $= *= with an empty value never match (Selectors §6.2)
         if (op == "^=") {
-          return val.value().size() >= attrVal.size() &&
+          return !attrVal.empty() && val.value().size() >= attrVal.size() &&
                  val.value().substr(0, attrVal.size()) == attrVal;
         }
         if (op == "$=") {
-          return val.value().size() >= attrVal.size() &&
+          return !attrVal.empty() && val.value().size() >= attrVal.size() &&
                  val.value().substr(val.value().size() - attrVal.size()) == attrVal;
         }
         if (op == "*=") {
-          return val.value().find(attrVal) != std::string::npos;
+          return !attrVal.empty() &&
+                 val.value().find(attrVal) != std::string::npos;
         }
         return false;
       }
     case SelectorType::PseudoClass:
       return matchPseudoClass(element, simple.value);
     case SelectorType::PseudoElement:
-      return matchPseudoElement(element, simple.value);
+      // No pseudo-element boxes are generated, so a rule such as
+      // p::before { ... } must not style the <p> itself
+      return false;
     default:
       return false;
     }
   }
 
   bool matchPseudoClass(dom::ElementPtr element, const std::string &name) {
-    if (name == "hover") {
-      return element->isHovered();
-    } else if (name == "active") {
-      return element->isActive();
-    } else if (name == "focus") {
-      return element->isFocused();
-    } else if (name == "first-child") {
-      return element->isFirstChild();
-    } else if (name == "last-child") {
-      return element->isLastChild();
-    } else if (name == "only-child") {
-      return element->isOnlyChild();
-    } else if (name == "empty") {
-      return element->isEmpty();
-    } else if (name == "root") {
-      return element->isDocumentRoot();
-    } else if (name.substr(0, 9) == "nth-child") {
-      // Parse :nth-child(an+b)
-      std::string args = name.substr(9);
-      if (args.size() >= 2 && args[0] == '(' && args.back() == ')') {
-        std::string formula = args.substr(1, args.size() - 2);
-        return matchNthChild(element, formula);
-      }
-    } else if (name.substr(0, 12) == "nth-last-child") {
-      std::string args = name.substr(12);
-      if (args.size() >= 2 && args[0] == '(' && args.back() == ')') {
-        std::string formula = args.substr(1, args.size() - 2);
-        return matchNthLastChild(element, formula);
-      }
-    } else if (name.substr(0, 11) == "nth-of-type") {
-      std::string args = name.substr(11);
-      if (args.size() >= 2 && args[0] == '(' && args.back() == ')') {
-        std::string formula = args.substr(1, args.size() - 2);
-        return matchNthOfType(element, formula);
-      }
-    } else if (name.substr(0, 3) == "not") {
-      // :not(selector) — enhanced with compound selector support
-      std::string args = name.substr(3);
-      if (args.size() >= 2 && args[0] == '(' && args.back() == ')') {
-        std::string inner = args.substr(1, args.size() - 2);
-        return !matchNotEnhanced(element, inner);
-      }
+    size_t paren = name.find('(');
+    if (paren != std::string::npos) {
+      std::string fn = dom::toLower(name.substr(0, paren));
+      std::string args = pseudoFunctionArgs(name);
+      if (fn == "nth-child")
+        return evaluateNthFormula(element->getElementSiblingIndex(), args);
+      if (fn == "nth-last-child")
+        return evaluateNthFormula(element->getElementSiblingIndexFromEnd(),
+                                  args);
+      if (fn == "nth-of-type")
+        return evaluateNthFormula(element->getElementSiblingIndexOfType(),
+                                  args);
+      if (fn == "nth-last-of-type")
+        return evaluateNthFormula(siblingIndexOfTypeFromEnd(element), args);
+      if (fn == "not")
+        return matchNotSelectorList(element, args);
+      // :where() matches like :is(); it only differs in specificity
+      if (fn == "is" || fn == "where")
+        return matchInnerSelectorList(element, args);
+      if (fn == "has")
+        return matchHasRelative(element, args);
+      if (fn == "lang")
+        return matchLang(element, args);
       return false;
-    } else if (name == "checked") {
-      return element->isChecked();
-    } else if (name == "disabled") {
-      return element->isDisabled();
-    } else if (name == "enabled") {
-      return !element->isDisabled();
-    } else if (name == "required") {
-      return element->hasAttribute("required");
-    } else if (name == "optional") {
-      return !element->hasAttribute("required");
-    } else if (name == "link") {
-      return element->isLink();
-    } else if (name == "visited") {
-      return element->isVisited();
-    } else if (name.compare(0, 3, "is(") == 0) {
-      // :is(selector-list) — full selector engine matching
-      return matchInnerSelectorList(element, pseudoFunctionArgs(name));
-    } else if (name.compare(0, 6, "where(") == 0) {
-      // :where(selector-list) — same matching, zero specificity contribution
-      return matchInnerSelectorList(element, pseudoFunctionArgs(name));
-    } else if (name.compare(0, 4, "has(") == 0) {
-      return matchHasRelative(element, pseudoFunctionArgs(name));
     }
 
-    // Phase 2: enhanced pseudo-classes (first-of-type, last-of-type,
-    // only-of-type, nth-last-of-type, target, lang(), :is(), :where(), :has())
-    return matchPseudoClassPhase2(element, name);
+    std::string pc = dom::toLower(name);
+    if (pc == "hover")
+      return element->isHovered();
+    if (pc == "active")
+      return element->isActive();
+    if (pc == "focus")
+      return element->isFocused();
+    if (pc == "first-child")
+      return element->isFirstChild();
+    if (pc == "last-child")
+      return element->isLastChild();
+    if (pc == "only-child")
+      return element->isOnlyChild();
+    if (pc == "empty")
+      return element->isEmpty();
+    if (pc == "root")
+      return element->isDocumentRoot();
+    if (pc == "checked")
+      return element->isChecked();
+    if (pc == "disabled")
+      return element->isDisabled();
+    if (pc == "enabled")
+      return !element->isDisabled();
+    if (pc == "required")
+      return element->hasAttribute("required");
+    if (pc == "optional")
+      return !element->hasAttribute("required");
+    if (pc == "link")
+      return element->isLink();
+    if (pc == "visited")
+      return element->isVisited();
+    if (pc == "first-of-type")
+      return element->getElementSiblingIndexOfType() == 1;
+    if (pc == "last-of-type")
+      return siblingIndexOfTypeFromEnd(element) == 1;
+    if (pc == "only-of-type")
+      return element->getElementSiblingIndexOfType() == 1 &&
+             siblingIndexOfTypeFromEnd(element) == 1;
+    // :target needs URL fragment navigation, which the engine lacks
+    return false;
   }
 
-  bool matchPseudoElement(dom::ElementPtr element, const std::string &name) {
-    (void)element;
-    (void)name;
-    // Pseudo-elements like ::before, ::after, ::first-line, ::first-letter
-    // These are typically handled during rendering
-    // For matching purposes, we consider them to match
+  static int siblingIndexOfTypeFromEnd(const dom::ElementPtr &element) {
+    int index = 1;
+    for (auto next = element->nextElementSibling(); next;
+         next = next->nextElementSibling()) {
+      if (next->localName() == element->localName())
+        index++;
+    }
+    return index;
+  }
+
+  // An+B microsyntax: "odd", "even", "5", "n", "-n+3", "2n + 1", "+n-2"
+  static bool parseAnPlusB(const std::string &formula, int &a, int &b) {
+    std::string s;
+    for (char c : formula) {
+      if (!std::isspace(static_cast<unsigned char>(c)))
+        s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (s == "odd") {
+      a = 2;
+      b = 1;
+      return true;
+    }
+    if (s == "even") {
+      a = 2;
+      b = 0;
+      return true;
+    }
+    auto parseInt = [](const std::string &t, int &out) {
+      size_t i = (!t.empty() && (t[0] == '+' || t[0] == '-')) ? 1 : 0;
+      if (i >= t.size() || t.size() - i > 9)
+        return false;
+      int v = 0;
+      for (size_t k = i; k < t.size(); ++k) {
+        if (t[k] < '0' || t[k] > '9')
+          return false;
+        v = v * 10 + (t[k] - '0');
+      }
+      out = (t[0] == '-') ? -v : v;
+      return true;
+    };
+    size_t n = s.find('n');
+    if (n == std::string::npos) {
+      a = 0;
+      return parseInt(s, b);
+    }
+    std::string aPart = s.substr(0, n);
+    std::string bPart = s.substr(n + 1);
+    if (aPart.empty() || aPart == "+")
+      a = 1;
+    else if (aPart == "-")
+      a = -1;
+    else if (!parseInt(aPart, a))
+      return false;
+    if (bPart.empty()) {
+      b = 0;
+      return true;
+    }
+    if (bPart[0] != '+' && bPart[0] != '-')
+      return false;
+    return parseInt(bPart, b);
+  }
+
+  // True when some n >= 0 satisfies a*n + b == index (index is 1-based)
+  static bool evaluateNthFormula(int index, const std::string &formula) {
+    int a = 0, b = 0;
+    if (!parseAnPlusB(formula, a, b))
+      return false;
+    if (a == 0)
+      return index == b;
+    int diff = index - b;
+    return diff % a == 0 && diff / a >= 0;
+  }
+
+  // :not(<selector-list>) — true when the element matches none of the
+  // selectors; an unparseable argument makes the whole selector invalid
+  bool matchNotSelectorList(dom::ElementPtr element, const std::string &list) {
+    auto selectors = CssParser::parseSelectorList(list);
+    if (selectors.empty())
+      return false;
+    for (const auto &selector : selectors) {
+      if (matchSelector(element, selector))
+        return false;
+    }
     return true;
   }
 
-  bool matchNthChild(dom::ElementPtr element, const std::string &formula) {
-    int siblingIndex = element->getElementSiblingIndex();
-    return evaluateNthFormula(siblingIndex, formula);
-  }
-
-  bool matchNthLastChild(dom::ElementPtr element, const std::string &formula) {
-    int siblingIndex = element->getElementSiblingIndexFromEnd();
-    return evaluateNthFormula(siblingIndex, formula);
-  }
-
-  bool matchNthOfType(dom::ElementPtr element, const std::string &formula) {
-    int siblingIndex = element->getElementSiblingIndexOfType();
-    return evaluateNthFormula(siblingIndex, formula);
-  }
-
-  bool evaluateNthFormula(int index, const std::string &formula) {
-    // Simplified nth-child formula evaluation
-    // Supported: "odd", "even", "n", "an+b" where a and b are integers
-    if (formula == "odd") {
-      return index % 2 == 1;
-    } else if (formula == "even") {
-      return index % 2 == 0;
-    } else if (formula == "n") {
-      return true;
-    } else if (formula.find("n") != std::string::npos) {
-      // Parse "an+b" format
-      std::string aStr, bStr;
-      size_t nPos = formula.find('n');
-      
-      if (nPos == 0) {
-        aStr = "1";
-      } else if (nPos == 1 && formula[0] == '-') {
-        aStr = "-1";
-      } else {
-        aStr = formula.substr(0, nPos);
-      }
-      
-      bStr = formula.substr(nPos + 1);
-      if (bStr.empty()) {
-        bStr = "0";
-      }
-      
-      int a = 0, b = 0;
-      try {
-        a = std::stoi(aStr);
-        b = std::stoi(bStr);
-      } catch (...) {
-        return false;
-      }
-      
-      if (a == 0) {
-        return index == b;
-      }
-      
-      // nth-child is 1-indexed
-      int adjustedIndex = index - b;
-      return adjustedIndex >= 0 && adjustedIndex % a == 0;
-    } else {
-      // Just a number
-      try {
-        int target = std::stoi(formula);
-        return index == target;
-      } catch (...) {
-        return false;
-      }
-    }
-  }
-
-  // Enhanced :not() with compound selectors
-  // Supports: :not(.class), :not(#id), :not(tag), :not(tag.class)
-  //           :not([attr]), :not(:pseudo)
-  bool matchNotEnhanced(dom::ElementPtr element, const std::string &inner) {
-    if (inner.empty()) return false;
-
-    // Simple single selector
-    if (inner[0] == '.') {
-      return element->hasClass(inner.substr(1));
-    }
-    if (inner[0] == '#') {
-      return element->id() == inner.substr(1);
-    }
-    if (inner[0] == '[') {
-      std::string content = inner.substr(1, inner.size() - 2);
-      size_t eqPos = content.find('=');
-      if (eqPos == std::string::npos) {
-        return element->hasAttribute(content);
-      }
-      std::string attrName = content.substr(0, eqPos);
-      std::string attrVal = content.substr(eqPos + 1);
-      auto v = element->getAttribute(attrName);
-      return v.has_value() && v.value() == attrVal;
-    }
-    if (inner[0] == ':') {
-      std::string pseudo = inner.substr(1);
-      if (pseudo == "empty") return element->isEmpty();
-      if (pseudo == "first-child") return element->isFirstChild();
-      if (pseudo == "last-child") return element->isLastChild();
+  // :lang(xx) — case-insensitive match against the nearest lang attribute,
+  // also accepting subtags ("en" matches "en-US")
+  bool matchLang(dom::ElementPtr element, const std::string &arg) {
+    std::string lang = dom::toLower(dom::trimWhitespace(arg));
+    if (lang.size() >= 2 && (lang.front() == '"' || lang.front() == '\'') &&
+        lang.back() == lang.front())
+      lang = lang.substr(1, lang.size() - 2);
+    if (lang.empty())
       return false;
-    }
 
-    // Compound: tag.class or tag#id
-    size_t dotPos = inner.find('.');
-    size_t hashPos = inner.find('#');
-    if (dotPos != std::string::npos) {
-      std::string tag = inner.substr(0, dotPos);
-      std::string cls = inner.substr(dotPos + 1);
-      return dom::toLower(element->localName()) == dom::toLower(tag) &&
-             element->hasClass(cls);
+    std::optional<std::string> val = element->getAttribute("lang");
+    dom::NodePtr parent = element->parentNode();
+    while (!val.has_value() && parent &&
+           parent->nodeType() == dom::NodeType::Element) {
+      val = std::static_pointer_cast<dom::Element>(parent)->getAttribute("lang");
+      parent = parent->parentNode();
     }
-    if (hashPos != std::string::npos) {
-      std::string tag = inner.substr(0, hashPos);
-      std::string id = inner.substr(hashPos + 1);
-      return dom::toLower(element->localName()) == dom::toLower(tag) &&
-             element->id() == id;
-    }
-
-    // Just a tag name
-    return dom::toLower(element->localName()) == dom::toLower(inner);
-  }
-
-  // Enhanced pseudo-class matching (phase 2):
-  // first-of-type, last-of-type, only-of-type, nth-last-of-type,
-  // target, lang(), :is(), :where(), :has()
-  bool matchPseudoClassPhase2(dom::ElementPtr element,
-                              const std::string &name) {
-    // :first-of-type
-    if (name == "first-of-type") {
-      auto prev = element->previousElementSibling();
-      while (prev) {
-        if (prev->localName() == element->localName()) return false;
-        prev = prev->previousElementSibling();
-      }
-      return true;
-    }
-
-    // :last-of-type
-    if (name == "last-of-type") {
-      auto next = element->nextElementSibling();
-      while (next) {
-        if (next->localName() == element->localName()) return false;
-        next = next->nextElementSibling();
-      }
-      return true;
-    }
-
-    // :only-of-type
-    if (name == "only-of-type") {
-      auto prev = element->previousElementSibling();
-      while (prev) {
-        if (prev->localName() == element->localName()) return false;
-        prev = prev->previousElementSibling();
-      }
-      auto next = element->nextElementSibling();
-      while (next) {
-        if (next->localName() == element->localName()) return false;
-        next = next->nextElementSibling();
-      }
-      return true;
-    }
-
-    // :nth-last-of-type(an+b)
-    if (name.substr(0, 16) == "nth-last-of-type") {
-      std::string args = name.substr(16);
-      if (args.size() >= 2 && args[0] == '(' && args.back() == ')') {
-        std::string formula = args.substr(1, args.size() - 2);
-        int count = 1;
-        auto next = element->nextElementSibling();
-        while (next) {
-          if (next->localName() == element->localName()) count++;
-          next = next->nextElementSibling();
-        }
-        if (formula == "odd") return count % 2 == 1;
-        if (formula == "even") return count % 2 == 0;
-        if (formula == "n") return true;
-        try {
-          int target = std::stoi(formula);
-          return count == target;
-        } catch (...) {}
-      }
+    if (!val.has_value())
       return false;
-    }
-
-    // :target
-    if (name == "target") {
-      return false;
-    }
-
-    // :lang(xx)
-    if (name.substr(0, 4) == "lang") {
-      std::string args = name.substr(4);
-      if (args.size() >= 2 && args[0] == '(' && args.back() == ')') {
-        std::string lang = args.substr(1, args.size() - 2);
-        auto val = element->getAttribute("lang");
-        if (!val.has_value()) {
-          auto parent = element->parentNode();
-          while (parent &&
-                 parent->nodeType() == dom::NodeType::Element) {
-            auto parentElem =
-                std::static_pointer_cast<dom::Element>(parent);
-            val = parentElem->getAttribute("lang");
-            if (val.has_value()) break;
-            parent = parent->parentNode();
-          }
-        }
-        if (val.has_value()) {
-          const std::string &v = val.value();
-          return v == lang || (v.size() > lang.size() &&
-                               v.substr(0, lang.size()) == lang &&
-                               v[lang.size()] == '-');
-        }
-      }
-      return false;
-    }
-
-    return false; // Not handled
+    std::string v = dom::toLower(val.value());
+    return v == lang || (v.size() > lang.size() &&
+                         v.compare(0, lang.size(), lang) == 0 &&
+                         v[lang.size()] == '-');
   }
 
   void applyDeclarations(ComputedStyle &style,
@@ -562,9 +455,13 @@ private:
     for (const auto &decl : decls) {
       // Skip declarations that don't match the important filter
       if (decl.important != importantOnly) continue;
+      // Custom properties were already cascaded by applyCustomProperties
+      if (isCustomPropertyName(decl.property)) continue;
 
-      // Resolve CSS variables (var()) before parsing values
-      std::string resolvedValue = resolveCSSVariable(decl.value, style);
+      // Resolve var() references; one that cannot be resolved makes the
+      // declaration invalid at computed-value time, i.e. it acts as 'unset'
+      std::string resolvedValue =
+          substituteVariables(decl.value, style, 0).value_or("unset");
       const std::string& value = resolvedValue;
 
       // CSS-wide keywords (inherit / initial / unset)
@@ -763,7 +660,7 @@ private:
       } else if (decl.property == "flex-basis") {
         style.flexBasis = parseLength(value);
       } else if (decl.property == "flex") {
-        // Shorthand: none | auto | <grow> [<shrink> | <basis>]* 
+        // Shorthand: none | auto | [ <grow> <shrink>? || <basis> ]
         auto parts = splitCssValues(value);
         if (!parts.empty()) {
           if (parts.size() == 1 && parts[0] == "none") {
@@ -775,57 +672,45 @@ private:
             style.flexShrink = 1.0f;
             style.flexBasis = Length::Auto();
           } else {
-            try {
-              style.flexGrow = std::stof(parts[0]);
-            } catch (...) {}
-            style.flexShrink = 1.0f;
-            style.flexBasis = Length::Percent(0);
-            bool sawShrink = false;
-            for (size_t i = 1; i < parts.size(); ++i) {
-              const std::string &part = parts[i];
-              bool isNumber =
-                  part.find_first_not_of("0123456789.-") == std::string::npos;
-              if (!sawShrink && isNumber) {
-                try {
-                  style.flexShrink = std::stof(part);
-                  sawShrink = true;
-                } catch (...) {}
+            // Omitted grow/shrink default to 1 and an omitted basis to 0%,
+            // so "flex: 100px" means 1 1 100px (not grow = 100)
+            float grow = 1.0f, shrink = 1.0f;
+            Length basis = Length::Percent(0);
+            int numbers = 0;
+            for (const auto &part : parts) {
+              float n = 0.0f;
+              if (numbers < 2 && parsePlainNumber(part, n)) {
+                (numbers == 0 ? grow : shrink) = n;
+                numbers++;
               } else {
-                style.flexBasis = parseLength(part);
+                basis = parseLength(part);
               }
             }
+            style.flexGrow = grow;
+            style.flexShrink = shrink;
+            style.flexBasis = basis;
           }
         }
-      } else if (decl.property.substr(0, 2) == "--") {
-        // CSS Custom Properties (CSS Variables)
-        std::string varName = decl.property;
-        std::string varValue = value;
-        if (varValue.find("rgb") != std::string::npos) {
-          style.setCustomProperty(varName, parseFunctionalColor(varValue));
-        } else if (varValue.find("hsl") != std::string::npos) {
-          style.setCustomProperty(varName, parseHSLColor(varValue));
-        } else if (varValue[0] == '#') {
-          style.setCustomProperty(varName, parseColor(varValue));
-        } else if (varValue.find("px") != std::string::npos || 
-                   varValue.find("em") != std::string::npos ||
-                   varValue.find("rem") != std::string::npos ||
-                   varValue.find("%") != std::string::npos) {
-          style.setCustomProperty(varName, parseLength(varValue));
-        } else {
-          style.setCustomProperty(varName, varValue);
-        }
       } else if (decl.property == "border") {
-        // Simple shorthand parsing: "width style color"
-        // We only care about width and color for now.
-        // E.g. "2px solid red"
-        std::stringstream ss(value);
-        std::string part;
-        while (ss >> part) {
-          if (part == "solid" || part == "dashed" || part == "dotted") {
-            // Style ignored for now
-          } else if (std::isdigit(part[0]) ||
+        // <width> || <style> || <color>. Border styles are drawn as solid,
+        // but 'none'/'hidden' compute the border width to 0.
+        bool noStyle = false;
+        for (const auto &part : splitCssValues(value)) {
+          if (part == "none" || part == "hidden") {
+            noStyle = true;
+          } else if (part == "solid" || part == "dashed" || part == "dotted" ||
+                     part == "double" || part == "groove" || part == "ridge" ||
+                     part == "inset" || part == "outset") {
+            // drawn as solid
+          } else if (part == "thin" || part == "medium" || part == "thick") {
+            auto l = Length::Px(part == "thin" ? 1.0f
+                                : part == "medium" ? 3.0f
+                                                   : 5.0f);
+            style.borderTopWidth = style.borderRightWidth =
+                style.borderBottomWidth = style.borderLeftWidth = l;
+          } else if (std::isdigit(static_cast<unsigned char>(part[0])) ||
                      (part.size() > 1 && part[0] == '.' &&
-                      std::isdigit(part[1]))) {
+                      std::isdigit(static_cast<unsigned char>(part[1])))) {
             auto l = parseLength(part);
             style.borderTopWidth = style.borderRightWidth =
                 style.borderBottomWidth = style.borderLeftWidth = l;
@@ -835,6 +720,10 @@ private:
             style.borderTopColor = style.borderRightColor =
                 style.borderBottomColor = style.borderLeftColor = c;
           }
+        }
+        if (noStyle) {
+          style.borderTopWidth = style.borderRightWidth =
+              style.borderBottomWidth = style.borderLeftWidth = Length::Px(0);
         }
       } else if (decl.property == "border-width") {
         applyBoxLengths(style.borderTopWidth, style.borderRightWidth,
@@ -908,11 +797,16 @@ private:
           style.zIndex = std::stoi(value);
         } catch (...) {}
       } else if (decl.property == "opacity") {
+        // <number> | <percentage>, clamped to [0, 1]
+        float v = 1.0f;
         try {
-          style.opacity = std::stof(value);
+          v = std::stof(value);
         } catch (...) {
-          style.opacity = 1.0f;
+          v = 1.0f;
         }
+        if (value.find('%') != std::string::npos)
+          v /= 100.0f;
+        style.opacity = std::clamp(v, 0.0f, 1.0f);
       } else if (decl.property == "transform") {
         if (value != "none") {
           style.transform = value;
@@ -974,10 +868,13 @@ private:
         style.gridColumnGap = parseLength(value);
       } else if (decl.property == "grid-row-gap" || decl.property == "row-gap") {
         style.gridRowGap = parseLength(value);
-      } else if (decl.property == "gap") {
-        auto l = parseLength(value);
-        style.gridColumnGap = l;
-        style.gridRowGap = l;
+      } else if (decl.property == "gap" || decl.property == "grid-gap") {
+        // <row-gap> <column-gap>?
+        auto parts = splitCssValues(value);
+        if (!parts.empty()) {
+          style.gridRowGap = parseLength(parts[0]);
+          style.gridColumnGap = parseLength(parts.size() > 1 ? parts[1] : parts[0]);
+        }
       } else if (decl.property == "grid-auto-flow") {
         if (value == "column")
           style.gridAutoFlow = GridAutoFlow::Column;
@@ -1715,72 +1612,183 @@ private:
     return Color::Black();
   }
 
-  std::string resolveCSSVariable(const std::string& value, const ComputedStyle& style) {
-    (void)style; // Suppress unused warning - style used in property lookup
-    // Check if value contains var()
-    size_t varPos = value.find("var(");
-    if (varPos == std::string::npos) {
-      return value;
-    }
+  // ── Custom properties / var() ───────────────────────────────
 
-    std::string result = value;
-    size_t start = 0;
+  static bool isCustomPropertyName(const std::string &name) {
+    return name.size() > 2 && name[0] == '-' && name[1] == '-';
+  }
 
-    while ((start = result.find("var(", start)) != std::string::npos) {
-      size_t endParen = result.find(')', start);
-      if (endParen == std::string::npos) {
-        break;
-      }
-
-      std::string varContent = result.substr(start + 4, endParen - start - 4);
-
-      // Remove whitespace
-      varContent.erase(remove_if(varContent.begin(), varContent.end(), isspace), varContent.end());
-
-      // Get variable name
-      size_t commaPos = varContent.find(',');
-      std::string varName = (commaPos != std::string::npos) 
-                           ? varContent.substr(0, commaPos) 
-                           : varContent;
-      std::string fallback = (commaPos != std::string::npos) 
-                              ? varContent.substr(commaPos + 1) 
-                              : "";
-
-      // Try to get custom property value from style
-      const CustomPropertyValue* propValue = style.getCustomProperty(varName);
-      std::string replacement;
-
-      if (propValue) {
-        if (std::holds_alternative<std::string>(*propValue)) {
-          replacement = std::get<std::string>(*propValue);
-        } else if (std::holds_alternative<Length>(*propValue)) {
-          const Length& len = std::get<Length>(*propValue);
-          if (len.unit == Length::Unit::Px) {
-            replacement = std::to_string(len.value) + "px";
-          } else if (len.unit == Length::Unit::Percent) {
-            replacement = std::to_string(len.value) + "%";
-          } else if (len.unit == Length::Unit::Em) {
-            replacement = std::to_string(len.value) + "em";
-          }
-        } else if (std::holds_alternative<Color>(*propValue)) {
-          const Color& col = std::get<Color>(*propValue);
-          char hexBuffer[8];
-          snprintf(hexBuffer, sizeof(hexBuffer), "#%02x%02x%02x", col.r, col.g, col.b);
-          replacement = hexBuffer;
+  // Cascade the element's custom properties: the winning declaration per
+  // name (important over normal, then specificity and order) with var()
+  // references between them resolved. Values stay text so they substitute
+  // verbatim ("1px solid red", "rgba(0, 0, 0, 0.5)", "2rem").
+  void applyCustomProperties(ComputedStyle &style,
+                             const std::vector<MatchResult> &matches,
+                             const ComputedStyle *parentStyle) {
+    std::unordered_map<std::string, std::string> winners;
+    for (bool important : {false, true}) {
+      for (const auto &match : matches) {
+        for (const auto &decl : match.rule->declarations) {
+          if (decl.important == important &&
+              isCustomPropertyName(decl.property))
+            winners[decl.property] = decl.value;
         }
       }
-
-      // Use fallback if no value found
-      if (replacement.empty()) {
-        replacement = fallback;
-      }
-
-      // Replace the var() with the resolved value
-      result.replace(start, endParen - start + 1, replacement);
-      start += replacement.length();
     }
 
-    return result;
+    std::vector<std::string> pending;
+    for (const auto &entry : winners) {
+      const std::string &name = entry.first;
+      const std::string &value = entry.second;
+      if (value == "initial") {
+        style.customProperties.erase(name);
+      } else if (value == "inherit" || value == "unset") {
+        const CustomPropertyValue *inherited =
+            parentStyle ? parentStyle->getCustomProperty(name) : nullptr;
+        if (inherited)
+          style.setCustomProperty(name, *inherited);
+        else
+          style.customProperties.erase(name);
+      } else {
+        style.setCustomProperty(name, value);
+        pending.push_back(name);
+      }
+    }
+
+    // Resolve against the raw values first and publish afterwards, so the
+    // outcome does not depend on the order of the declarations
+    std::vector<std::pair<std::string, std::optional<std::string>>> resolved;
+    for (const auto &name : pending)
+      resolved.emplace_back(name, substituteVariables(winners[name], style, 0));
+    for (const auto &entry : resolved) {
+      if (entry.second)
+        style.setCustomProperty(entry.first, *entry.second);
+      else
+        style.customProperties.erase(entry.first); // cyclic or unresolvable
+    }
+  }
+
+  static std::string customPropertyText(const CustomPropertyValue &v) {
+    if (const auto *text = std::get_if<std::string>(&v))
+      return *text;
+    if (const auto *len = std::get_if<Length>(&v)) {
+      switch (len->unit) {
+      case Length::Unit::Px:
+        return std::to_string(len->value) + "px";
+      case Length::Unit::Percent:
+        return std::to_string(len->value) + "%";
+      case Length::Unit::Em:
+        return std::to_string(len->value) + "em";
+      case Length::Unit::Rem:
+        return std::to_string(len->value) + "rem";
+      case Length::Unit::Auto:
+        return "auto";
+      }
+      return "";
+    }
+    const Color &c = std::get<Color>(v);
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "#%02x%02x%02x%02x", c.r, c.g, c.b, c.a);
+    return buf;
+  }
+
+  // Index of the ')' that closes the '(' at openPos, or npos
+  static size_t findMatchingParen(const std::string &s, size_t openPos) {
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = openPos; i < s.size(); ++i) {
+      char c = s[i];
+      if (quote) {
+        if (c == '\\')
+          ++i;
+        else if (c == quote)
+          quote = 0;
+      } else if (c == '"' || c == '\'') {
+        quote = c;
+      } else if (c == '(') {
+        ++depth;
+      } else if (c == ')' && --depth == 0) {
+        return i;
+      }
+    }
+    return std::string::npos;
+  }
+
+  static size_t findTopLevelComma(const std::string &s) {
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+      char c = s[i];
+      if (quote) {
+        if (c == '\\')
+          ++i;
+        else if (c == quote)
+          quote = 0;
+      } else if (c == '"' || c == '\'') {
+        quote = c;
+      } else if (c == '(') {
+        ++depth;
+      } else if (c == ')') {
+        --depth;
+      } else if (c == ',' && depth == 0) {
+        return i;
+      }
+    }
+    return std::string::npos;
+  }
+
+  static constexpr int kMaxVarDepth = 32;
+
+  // Replace every var(--name[, fallback]) in value. Returns nullopt when a
+  // reference has neither a value nor a fallback, or when references nest
+  // too deeply (cycles).
+  static std::optional<std::string>
+  substituteVariables(const std::string &value, const ComputedStyle &style,
+                      int depth) {
+    if (value.find("var(") == std::string::npos)
+      return value;
+    if (depth > kMaxVarDepth)
+      return std::nullopt;
+
+    std::string result;
+    size_t pos = 0;
+    while (true) {
+      size_t start = value.find("var(", pos);
+      if (start == std::string::npos) {
+        result += value.substr(pos);
+        return result;
+      }
+      size_t close = findMatchingParen(value, start + 3);
+      if (close == std::string::npos)
+        return std::nullopt;
+      result += value.substr(pos, start - pos);
+
+      std::string inner = value.substr(start + 4, close - start - 4);
+      size_t comma = findTopLevelComma(inner);
+      std::string name = dom::trimWhitespace(inner.substr(0, comma));
+      std::optional<std::string> replacement;
+      if (const CustomPropertyValue *v = style.getCustomProperty(name))
+        replacement =
+            substituteVariables(customPropertyText(*v), style, depth + 1);
+      if (!replacement && comma != std::string::npos)
+        replacement = substituteVariables(
+            dom::trimWhitespace(inner.substr(comma + 1)), style, depth + 1);
+      if (!replacement)
+        return std::nullopt;
+      result += *replacement;
+      pos = close + 1;
+    }
+  }
+
+  // A bare <number> such as "1" or "0.5" (no unit)
+  static bool parsePlainNumber(const std::string &s, float &out) {
+    try {
+      size_t idx = 0;
+      out = std::stof(s, &idx);
+      return idx == s.size();
+    } catch (...) {
+      return false;
+    }
   }
 
   uint8_t hexCharToInt(char c) {

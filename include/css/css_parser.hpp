@@ -24,11 +24,12 @@ public:
       if (peek().is(TokenType::EndOfFile))
         break;
 
-      if (peek().is(TokenType::AtKeyword) || peek().is(TokenType::CDO) ||
-          peek().is(TokenType::CDC)) {
-        // Skip At-rules and CDO/CDC for MVP
-        consumeUntil(TokenType::CloseCurly); // Very naive skipping
-        consumeIgnoreEOF();                  // Consume the }
+      if (peek().is(TokenType::CDO) || peek().is(TokenType::CDC)) {
+        consume(); // <!-- and --> are ignored at the top level
+        continue;
+      }
+      if (peek().is(TokenType::AtKeyword)) {
+        skipAtRule(); // At-rules are not applied yet
         continue;
       }
 
@@ -69,16 +70,17 @@ public:
   }
 
   // Specificity contribution of a functional pseudo-class, per CSS Selectors
-  // Level 4: :where(...) is always zero; :is(...)/:has(...) weigh their most
-  // specific argument. Returns nullopt when there is no special rule (unknown
-  // function) or the argument list cannot be parsed — callers then keep the
-  // plain (0,1,0) pseudo-class weight.
+  // Level 4: :where(...) is always zero; :is(...)/:not(...)/:has(...) weigh
+  // their most specific argument. Returns nullopt when there is no special
+  // rule (unknown function) or the argument list cannot be parsed — callers
+  // then keep the plain (0,1,0) pseudo-class weight.
   static std::optional<Specificity>
-  functionalPseudoSpecificity(const std::string &funcName,
+  functionalPseudoSpecificity(const std::string &name,
                               const std::string &args) {
+    const std::string funcName = asciiLower(name);
     if (funcName == "where")
       return Specificity{}; // always zero, even for unparseable arguments
-    if (funcName != "is" && funcName != "has")
+    if (funcName != "is" && funcName != "not" && funcName != "has")
       return std::nullopt;
 
     std::string list = args;
@@ -121,6 +123,60 @@ private:
     return s;
   }
 
+  static std::string asciiLower(std::string s) {
+    for (char &c : s) {
+      if (c >= 'A' && c <= 'Z')
+        c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+  }
+
+  // Re-serialize a string token so that re-parsing yields the same string
+  static std::string quoteString(const std::string &s) {
+    std::string out = "\"";
+    for (char c : s) {
+      if (c == '"' || c == '\\')
+        out += '\\';
+      out += c;
+    }
+    out += '"';
+    return out;
+  }
+
+  // Append one declaration-value token to its textual form. Function and
+  // paren nesting is tracked so nested calls such as
+  // var(--x, rgb(1, 2, 3)) keep every component.
+  static void appendValueToken(std::string &out, const Token &t, int &depth) {
+    if (t.is(TokenType::Whitespace)) {
+      if (!out.empty() && out.back() != ' ')
+        out += " ";
+    } else if (t.is(TokenType::Function)) {
+      out += t.value + "(";
+      depth++;
+    } else if (t.is(TokenType::OpenParen)) {
+      out += "(";
+      depth++;
+    } else if (t.is(TokenType::CloseParen)) {
+      out += ")";
+      if (depth > 0)
+        depth--;
+    } else if (t.is(TokenType::String)) {
+      out += quoteString(t.value);
+    } else if (t.is(TokenType::Url)) {
+      out += "url(" + t.value + ")";
+    } else if (t.is(TokenType::Hash)) {
+      out += "#" + t.value;
+    } else if (t.is(TokenType::Dimension)) {
+      out += formatNumber(t.numberValue) + t.unit;
+    } else if (t.is(TokenType::Number)) {
+      out += formatNumber(t.numberValue);
+    } else if (t.is(TokenType::Percentage)) {
+      out += formatNumber(t.numberValue) + "%";
+    } else {
+      out += t.value; // Ident, Delim, Comma, Colon, Semicolon, brackets
+    }
+  }
+
   Token peek() const {
     if (position_ >= tokens_.size())
       return {TokenType::EndOfFile};
@@ -154,6 +210,25 @@ private:
     while (position_ < tokens_.size() && !peek().is(TokenType::EndOfFile) &&
            !peek().is(type)) {
       consume();
+    }
+  }
+
+  // Statement at-rules (@import, @charset) end at ';', block at-rules
+  // (@media, @font-face) after their balanced {...} block — skipping only to
+  // the first '}' would swallow the following rule or leak nested ones.
+  void skipAtRule() {
+    consume(); // at-keyword
+    int depth = 0;
+    while (position_ < tokens_.size() && !peek().is(TokenType::EndOfFile)) {
+      Token t = consume();
+      if (depth == 0 && t.is(TokenType::Semicolon))
+        return;
+      if (t.is(TokenType::OpenCurly)) {
+        depth++;
+      } else if (t.is(TokenType::CloseCurly)) {
+        if (--depth <= 0)
+          return;
+      }
     }
   }
 
@@ -347,20 +422,33 @@ private:
             std::string funcName = consume().value;
             std::string args;
 
-            // Collect function arguments (inline token reconstruction)
+            // Collect function arguments (inline token reconstruction).
+            // Nested functions/parens keep their own ')' so that arguments
+            // such as :not(:nth-child(2)) survive intact.
+            int depth = 0;
             while (position_ < tokens_.size() &&
-                   !peek().is(TokenType::CloseParen) &&
                    !peek().is(TokenType::EndOfFile)) {
+              if (depth == 0 && peek().is(TokenType::CloseParen))
+                break;
               Token arg = consume();
               if (arg.is(TokenType::Whitespace)) {
                 if (!args.empty() && args.back() != ' ')
                   args += " ";
-              } else if (arg.is(TokenType::Comma)) {
-                args += ",";
-              } else if (arg.is(TokenType::Ident) || arg.is(TokenType::Delim)) {
-                args += arg.value;
+              } else if (arg.is(TokenType::Function)) {
+                args += arg.value + "(";
+                depth++;
+              } else if (arg.is(TokenType::OpenParen)) {
+                args += "(";
+                depth++;
+              } else if (arg.is(TokenType::CloseParen)) {
+                args += ")";
+                depth--;
               } else if (arg.is(TokenType::Hash)) {
                 args += "#" + arg.value;
+              } else if (arg.is(TokenType::String)) {
+                args += quoteString(arg.value);
+              } else if (!arg.repr.empty()) {
+                args += arg.repr; // numbers keep their sign: 2n+1, -n+3
               } else if (arg.is(TokenType::Number)) {
                 args += formatNumber(arg.numberValue);
               } else if (arg.is(TokenType::Percentage)) {
@@ -371,6 +459,8 @@ private:
                 args += arg.value;
               }
             }
+            while (!args.empty() && args.back() == ' ')
+              args.pop_back();
             if (peek().is(TokenType::CloseParen)) {
               consume(); // )
             }
@@ -469,6 +559,9 @@ private:
     if (!peek().is(TokenType::Ident))
       return std::nullopt;
     decl.property = consume().value;
+    // Property names are ASCII case-insensitive; custom properties are not
+    if (decl.property.compare(0, 2, "--") != 0)
+      decl.property = asciiLower(decl.property);
 
     consumeWhitespace();
     if (!peek().is(TokenType::Colon))
@@ -476,80 +569,34 @@ private:
     consume(); // :
     consumeWhitespace();
 
-    // Value parsing: consume until ; or }
-    while (position_ < tokens_.size() && !peek().is(TokenType::Semicolon) &&
-           !peek().is(TokenType::CloseCurly)) {
-      // Check for !important
-      if (peek().is(TokenType::Delim) && peek().value == "!") {
-        consume();
-        if (peek().is(TokenType::Ident) && peek().value == "important") {
+    // Value parsing: consume until ; or } (a ';' inside a function such as an
+    // unquoted data: URL does not end the declaration)
+    int depth = 0;
+    while (position_ < tokens_.size() && !peek().is(TokenType::EndOfFile) &&
+           !peek().is(TokenType::CloseCurly) &&
+           !(depth == 0 && peek().is(TokenType::Semicolon))) {
+      // "!important" — whitespace may separate '!' from the keyword, and the
+      // keyword is case-insensitive
+      if (depth == 0 && peek().is(TokenType::Delim) && peek().value == "!") {
+        size_t next = position_ + 1;
+        while (next < tokens_.size() &&
+               tokens_[next].is(TokenType::Whitespace))
+          ++next;
+        if (next < tokens_.size() && tokens_[next].is(TokenType::Ident) &&
+            asciiLower(tokens_[next].value) == "important") {
           decl.important = true;
-          consume();
+          position_ = next + 1;
           continue;
-        } else {
-          decl.value += "!";
         }
       }
 
-      Token t = consume();
-      if (t.is(TokenType::Whitespace)) {
-        if (!decl.value.empty() && decl.value.back() != ' ') {
-          decl.value += " ";
-        }
-      } else if (t.is(TokenType::Function)) {
-        decl.value += t.value + "(";
-        while (position_ < tokens_.size() &&
-               !peek().is(TokenType::CloseParen) &&
-               !peek().is(TokenType::EndOfFile)) {
-          Token arg = consume();
-          if (arg.is(TokenType::Whitespace)) {
-            if (!decl.value.empty() && decl.value.back() != ' ') {
-              decl.value += " ";
-            }
-          } else if (arg.is(TokenType::Comma)) {
-            decl.value += ",";
-          } else if (arg.is(TokenType::Number)) {
-            decl.value += formatNumber(arg.numberValue);
-          } else if (arg.is(TokenType::Percentage)) {
-            decl.value += formatNumber(arg.numberValue) + "%";
-          } else if (arg.is(TokenType::Dimension)) {
-            decl.value += formatNumber(arg.numberValue) + arg.unit;
-          } else if (arg.is(TokenType::Ident)) {
-            decl.value += arg.value;
-          } else if (arg.is(TokenType::Delim)) {
-            decl.value += arg.value;
-          } else if (arg.is(TokenType::Hash)) {
-            decl.value += "#" + arg.value;
-          } else if (arg.is(TokenType::String)) {
-            decl.value += "\"" + arg.value + "\"";
-          }
-        }
-        if (peek().is(TokenType::CloseParen)) {
-          decl.value += ")";
-          consume();
-        }
-      } else if (t.is(TokenType::String)) {
-        decl.value += "\"" + t.value + "\"";
-      } else if (t.is(TokenType::Url)) {
-        decl.value += "url(" + t.value + ")";
-      } else if (t.is(TokenType::Dimension)) {
-        decl.value +=
-            formatNumber(t.numberValue) + t.unit; // Rough reconstruction
-      } else if (t.is(TokenType::Number)) {
-        decl.value += formatNumber(t.numberValue);
-      } else if (t.is(TokenType::Percentage)) {
-        decl.value += formatNumber(t.numberValue) + "%";
-      } else if (t.is(TokenType::Hash)) {
-        decl.value += "#" + t.value;
-      } else if (t.is(TokenType::Ident)) {
-        decl.value += t.value;
-      } else if (t.is(TokenType::Delim)) {
-        decl.value += t.value;
-      } else if (t.is(TokenType::Comma)) {
-        decl.value += ",";
-      }
-      // ... incomplete value reconstruction but good enough for storage
+      appendValueToken(decl.value, consume(), depth);
     }
+
+    // Whitespace before ';', '}' or '!important' is not part of the value;
+    // keyword comparisons ("none", "block", ...) need the exact token
+    while (!decl.value.empty() && decl.value.back() == ' ')
+      decl.value.pop_back();
 
     if (peek().is(TokenType::Semicolon)) {
       consume();
