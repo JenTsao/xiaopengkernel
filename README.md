@@ -47,7 +47,7 @@ XiaopengKernel 是一个从零开始构建的、自研的轻量级浏览器 / HT
 - 🔤 **矢量字体支持** —— FreeType 光栅化 + HarfBuzz 文本整形（Text Shaping）
 - ⚡ **多线程解析** —— 主线程事件循环 + 后台 `ParseThread`，支持边下载边解析
 - 🧩 **JavaScript 集成** —— QuickJS 轻量级 JS 引擎（ES2020）+ 完整 DOM API、事件、定时器绑定
-- 🌍 **网络资源加载** —— HTTP/1.1、HTTP/2、HTTP/3（QUIC）支持，连接池、LRU 缓存、同源策略与 CORS 安全机制
+- 🌍 **网络资源加载** —— HTTP/1.1 与 HTTP/2（由 libcurl 提供；尚未实现 HTTP/3/QUIC），连接池、LRU 缓存、同源策略与 CORS 安全机制
 
 ## 🏗️ 架构总览
 
@@ -176,22 +176,22 @@ int main() {
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| **HTML 解析器** | ✅ 完整 | WHATWG 规范状态机，65 个解析状态，250+ 命名字符引用，C1 数字引用映射，上下文片段解析 |
+| **HTML 解析器** | ✅ 完整 | WHATWG 风格状态机（数据/标签/属性/注释/DOCTYPE/RCDATA/RAWTEXT/脚本数据/PLAINTEXT/CDATA）、250+ 命名字符引用、C1 数字引用映射、上下文片段解析、adoption agency、表格 foster parenting |
 | **CSS 解析器** | ✅ 完善 | 选择器解析、属性选择器、伪类 / 伪元素、样式继承、简写展开、CSS 变量、em/rem 单位 |
 | **DOM 树** | ✅ 完整 | Element / Document / TextNode / Comment 及完整 API |
-| **布局引擎** | ✅ 进阶 | Block / Inline / Flexbox / Grid，BFC / IFC 混合排版 |
+| **布局引擎** | ✅ 进阶 | Block / Inline / Flexbox / Grid（Grid 为基础实现），BFC / IFC 混合排版 |
 | **层叠上下文** | ✅ 完整 | CSS 2.1 层叠规则，z-index 排序，PaintLayer 图层管理 |
-| **渲染引擎** | ✅ 进阶 | 软件渲染 + OpenGL GPU 加速，FreeType + HarfBuzz 字体 |
+| **渲染引擎** | ⚠️ 部分 | 软件渲染完整；OpenGL 后端目前只绘制背景/边框，文本与图片仍走未合成的软件路径 |
 | **JS 引擎** | ✅ 集成 | QuickJS + DOM / 事件 / 定时器 / Promise 绑定 |
-| **网络加载** | ✅ 完整 | HTTP/1.1·2·3，连接池，LRU 缓存，同源 / CORS 安全 |
+| **网络加载** | ✅ 完整 | HTTP/1.1 与 HTTP/2（libcurl，尚未实现 HTTP/3）、连接池、LRU 缓存、同源 / CORS 安全 |
 | **事件系统** | ✅ 进阶 | 捕获 / 目标 / 冒泡三阶段事件流，命中测试（Hit Testing） |
 | **事件循环** | ✅ 进阶 | WHATWG 事件循环、浏览上下文、页面生命周期 |
 
 ### 核心模块详解
 
 **1. HTML / CSS 解析**
-- 完整 WHATWG 规范 HTML 词法分析器（65 个状态）+ 树构建器（23+ 插入模式）
-- 字符引用：250+ 命名实体（希腊字母、箭头、数学符号、引号破折号等）、最长匹配回溯、数字引用的 C1 windows-1252 映射
+- 完整 WHATWG 风格 HTML 词法分析器：数据 / 标签 / 属性 / 注释 / DOCTYPE / RCDATA / RAWTEXT / 脚本数据 / PLAINTEXT / CDATA 状态，CRLF 规范化与 NUL 处理
+- 字符引用：250+ 命名实体（希腊字母、箭头、数学符号、引号破折号等）、最长匹配回溯、仅 HTML4 遗留实体允许省略分号、属性值历史规则、数字引用的 C1 windows-1252 映射
 - 上下文片段解析：`parseFragment(html, context)` —— 片段按容器（td/tr/select 等）的插入模式解析，`insertAdjacentHTML` 与 `innerHTML` 均已接入
 - CSS 选择器：Tag、Class、Id、Attribute、Pseudo-class、Pseudo-element
 - 属性选择器运算符：`=`、`~=`、`|=`、`^=`、`$=`、`*=`
@@ -209,9 +209,9 @@ int main() {
 - 层叠上下文：13 种触发条件，7 步绘制顺序
 
 **3. 渲染引擎**
-- 软件渲染：基于像素缓冲的 Canvas，自研光栅化器，支持抗锯齿
-- OpenGL 渲染：GPU 加速，帧缓冲区管理
-- 矢量字体：FreeType 光栅化 + HarfBuzz 文本整形
+- 软件渲染：基于像素缓冲的 Canvas，自研光栅化器，支持 alpha 混合
+- OpenGL 渲染：Framebuffer 后端已接通矩形绘制，但文本、图片与文本装饰仍写入软件缓冲且未合成到纹理；无 FBO 支持时自动回退软件渲染
+- 矢量字体：FreeType 光栅化 + HarfBuzz 文本整形（支持 8-bit / 1-bit 字形位图）
 - 图层管理：PaintLayer 支持负 / 正 z-index 分组
 
 **4. JavaScript 集成（QuickJS）**
@@ -237,11 +237,11 @@ int main() {
 
 ## 🧪 测试
 
-项目包含 **100+** 单元测试用例，覆盖解析、布局、渲染、脚本与加载全链路。测试通过 CMake + CTest 管理：
+项目包含 **300+** 单元测试用例，覆盖解析、布局、渲染、脚本与加载全链路。测试通过 CMake + CTest 管理；任何用例失败都会使 CI 变红（JS 绑定用例同样按断言结果判定）。
 
 | 测试文件 | 覆盖范围 |
 |----------|----------|
-| `test_dom_binding.cpp` | Document / Element / Node / classList 全 API（40+ 用例） |
+| `test_dom_binding.cpp` | Document / Element / Node / classList 全 API（70+ JS 用例 + 树变更不变量） |
 | `test_phase2_selectors_stacking.cpp` | 属性选择器 + 伪类 + 层叠上下文（27 用例） |
 | `test_html_parser.cpp` | HTML 词法 / 树构建 |
 | `test_css_parser.cpp` | CSS 选择器 / 属性解析 |
@@ -266,31 +266,32 @@ int main() {
 cd build && ctest . --output-on-failure
 ```
 
-## 🧭 当前状态与 v1.0 路线图
+## 🧭 当前状态与已知限制
 
-> 以下评估基于对源码（约 2 万行核心 C++，不含 QuickJS 等第三方依赖）的静态分析。
+> 以下评估基于源码（`include/` + `src/` 约 2.9 万行 C++，不含测试与第三方依赖）的实际实现。
 
-项目已搭建一个非常完整且规范的现代浏览器引擎骨架，但距离能渲染大部分现代网页（如简单 Vue / React 站点）的"正式版"仍需填补以下核心差距：
+已实现：HTML/CSS 解析与 DOM、选择器与层叠、Block/Inline/Flex/Grid 布局（Grid 为基础实现）、软件渲染、QuickJS 绑定、加载器（连接池 / 缓存 / CORS / CSP）、后台解析线程与事件循环。
 
-**高优先级（v1.0 阻塞项）**
-1. **内联排版系统重构（IFC 完善）**：实现完整 Line Box Model，处理断行、内联块与 `vertical-align`，使图文混排正常显示。
-2. **盒模型与浮动（Floats & Stacking）**：完善层叠树（`RenderTree` / `PaintTree`）的 z-index 深度排序，支持脱离文档流的 `float`。
-3. **DOM 事件流完善**：完整实现标准 DOM 事件规范（捕获 / 目标 / 冒泡），并在 C++ 与 QuickJS 间妥善管理监听器生命周期（循环引用）。
+**已知限制（按影响排序，均可复现）**
 
-**中优先级（Beta 特性）**
-- 复杂选择器与样式继承（`:hover`、`:active`、`::before`、`inherit`）
-- 异步网络流（Streaming Parsing，边下载边解析边渲染）
-- Web API 补全：`fetch`、微任务队列、`XMLHttpRequest`
+1. **布局坐标契约不一致**：`dimensions().content.x/y` 由布局按"边框盒起点"生成，而绘制与命中测试按"内容盒"解释并再减去 padding/border。带内边距或边框的盒子，其子内容绘制位置会偏移，父级自动高度也随之偏差。
+2. **浮动**：左右浮动不会并排（各自独立找位置），后续段落不会绕排；`clear` 与 `findFloatPosition` 混用父级 padding 坐标系。
+3. **Flex / Grid**：flex/grid 项目不会递归布局其子内容；列方向 + 自动高度按 0 处理；flex-shrink 未按 `flex-shrink × 基准尺寸` 加权；grid 无自动放置，`span`/负线号不生效，不支持 `repeat()` / `minmax()`。
+4. **绝对 / 固定定位**：包含块按内容盒计算，自动高度在子级布局前读取，无定位祖先时使用固定 800×600 视口。
+5. **绘制顺序与裁剪**：定位元素与浮动的背景会在其子内容之后绘制（覆盖子内容）；`overflow:hidden` 只裁剪盒子自身，不裁剪后代。
+6. **OpenGL 后端**：仅绘制背景与边框；文本、图片、文本装饰写入软件缓冲但未合成到 GL 纹理，因此主程序在 GL 路径下看不到文字。无 FBO 支持时自动回退软件渲染。
+7. **表格与模板**：模板内容按 in-body 规则解析（无独立 "in template" 插入模式）；表格错误恢复为简化实现。
+8. **JS 绑定内存**：节点包装对象与创建过的节点在引擎生命周期内常驻，长时间运行的页面内存只增不减；`DocumentFragment.cloneNode()` 返回 `null`。
+9. **图像**：`<img src>` 的相对地址未按文档 base URL 解析；失败的加载不会被缓存。
+10. **事件**：`stopImmediatePropagation` 与 `once` 选项未实现。
+11. **布局属性**：`min/max-width/height` 未参与布局；`position:relative` 的偏移未应用。
 
-**粗略工期预估（单人全职）**
+**近期优先级**
 
-| 阶段 | 里程碑 | 预估工期 |
-| :--- | :--- | :--- |
-| **Alpha** | Acid1 测试及格；完善 IFC、层叠上下文、`display:flex` 剩余用例 | 1.5 – 2 个月 |
-| **Beta** | 可交互；JS 闭包 GC 与 DOM 事件流，跑通微型交互式 JS | 1 – 2 个月 |
-| **v1.0** | 框架支持；引入 Fetch API 与微任务队列，渲染极简版 Vue 3 | 2 – 3 个月 |
-
-总结：距离一个"极简但在真实世界能跑"的正式版，大约还差 **5 – 7 个月** 的集中开发量。
+1. 统一布局 / 绘制 / 命中测试的坐标契约，并补充几何断言测试。
+2. 浮动并排与绕排、BFC 高度包含浮动。
+3. flex/grid 项目递归布局与 grid 自动放置。
+4. OpenGL 文本/图片纹理合成，或明确只保留软件后端。
 
 ## 🗺️ 未来演进计划
 
