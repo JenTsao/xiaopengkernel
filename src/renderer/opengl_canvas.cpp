@@ -192,10 +192,12 @@ void OpenGLCanvas::initializeOpenGL() {
   // Unbind
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   glBindTexture(GL_TEXTURE_2D, 0);
+  glReady_ = true;
 #endif
 }
 
 void OpenGLCanvas::cleanupOpenGL() {
+  glReady_ = false;
 #ifdef ENABLE_OPENGL
   if (texture_) {
     glDeleteTextures(1, &texture_);
@@ -228,6 +230,8 @@ void OpenGLCanvas::resize(int width, int height) {
 
 void OpenGLCanvas::clear(Color color) {
 #ifdef ENABLE_OPENGL
+  if (!glReady_)
+    return; // No framebuffer: calling the GL entry points would crash
   // Bind framebuffer and clear
   glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
   glClearColor(color.r / 255.0f, color.g / 255.0f, color.b / 255.0f,
@@ -243,6 +247,8 @@ void OpenGLCanvas::clear(Color color) {
 
 void OpenGLCanvas::fillRect(int x, int y, int width, int height, Color color) {
 #ifdef ENABLE_OPENGL
+  if (!glReady_)
+    return;
   // For GPU acceleration, we'll use a simple approach:
   // 1. Bind framebuffer
   // 2. Use OpenGL to draw a rectangle

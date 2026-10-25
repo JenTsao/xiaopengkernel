@@ -40,7 +40,17 @@ bool BrowserEngine::initialize(const Config &cfg) {
 #ifdef ENABLE_OPENGL
   m_openglCanvas = std::make_unique<renderer::OpenGLCanvas>(m_config.windowWidth,
                                                            m_config.windowHeight);
-  std::cout << "[Engine] Using OpenGL renderer" << std::endl;
+  if (m_openglCanvas->isReady()) {
+    std::cout << "[Engine] Using OpenGL renderer" << std::endl;
+  } else {
+    // Missing framebuffer support (old drivers, VMs): the GL canvas cannot
+    // draw anything, so fall back to software rendering instead of crashing
+    std::cerr << "[Engine] OpenGL unavailable, using software renderer"
+              << std::endl;
+    m_openglCanvas.reset();
+    m_canvas = std::make_unique<renderer::BitmapCanvas>(m_config.windowWidth,
+                                                        m_config.windowHeight);
+  }
 #else
   m_canvas = std::make_unique<renderer::BitmapCanvas>(m_config.windowWidth,
                                                       m_config.windowHeight);
@@ -202,17 +212,18 @@ void BrowserEngine::onParseComplete(ParseResult result) {
 void BrowserEngine::executeScripts(
     const std::vector<dom::HtmlParser::ScriptData> &scripts) {
   for (const auto &script : scripts) {
-    // Skip async and defer scripts 鈥?they are handled separately
-    if (script.async || script.defer)
+    const bool external = !script.src.empty();
+    // defer/async only apply to external classic scripts; on an inline
+    // <script defer> they are ignored and the code runs right away
+    if (external && (script.async || script.defer))
       continue;
 
-    // Execute inline script content
-    if (!script.content.empty()) {
+    // A classic script with src ignores its inline text content
+    if (!external && !script.content.empty()) {
       m_scriptEngine.evaluate(script.content);
     }
 
-    // Fetch and execute external script (use ResourceTree if available)
-    if (!script.src.empty()) {
+    if (external) {
       std::string jsContent;
 
       // Try to get content from ResourceTree first
@@ -398,15 +409,11 @@ int BrowserEngine::run() {
   bool running = true;
 
   // Clear canvas to white initially
-#ifdef ENABLE_OPENGL
-  if (m_openglCanvas) {
+  if (m_openglCanvas && m_openglCanvas->isReady()) {
     m_openglCanvas->clear(renderer::Color::White());
-  }
-#else
-  if (m_canvas) {
+  } else if (m_canvas) {
     m_canvas->clear(renderer::Color::White());
   }
-#endif
 
   while (running) {
     // 1. Process Window Events
@@ -439,34 +446,27 @@ int BrowserEngine::run() {
       }
 
       if (m_needsPaint && m_layoutRoot) {
-#ifdef ENABLE_OPENGL
-        if (m_openglCanvas) {
+        if (m_openglCanvas && m_openglCanvas->isReady()) {
           m_openglCanvas->clear(renderer::Color::White());
           m_painter.paint(m_layoutRoot, *m_openglCanvas);
           m_window.drawOpenGLTexture(m_openglCanvas->getTexture());
-        }
-#else
-        if (m_canvas) {
+        } else if (m_canvas) {
           m_canvas->clear(renderer::Color::White());
           m_painter.paint(m_layoutRoot, *m_canvas);
           // Paint form controls on top of the layout
           m_formMgr.renderAll(*m_canvas);
           m_window.drawBuffer(*m_canvas);
         }
-#endif
         m_needsPaint = false;
       }
     } else if (m_state == EngineState::Loading && m_needsPaint) {
       // Show a blank white canvas while loading
-#ifdef ENABLE_OPENGL
-      if (m_openglCanvas) {
+      if (m_openglCanvas && m_openglCanvas->isReady()) {
         m_openglCanvas->clear(renderer::Color::White());
         m_openglCanvas->drawText(10, 10, "Loading...",
                                 renderer::Color{100, 100, 100, 255});
         m_window.drawOpenGLTexture(m_openglCanvas->getTexture());
-      }
-#else
-      if (m_canvas) {
+      } else if (m_canvas) {
         m_canvas->clear(renderer::Color::White());
         m_canvas->drawText(10, 10, "Loading...",
                           renderer::Color{100, 100, 100, 255});
@@ -474,7 +474,6 @@ int BrowserEngine::run() {
         m_formMgr.renderAll(*m_canvas);
         m_window.drawBuffer(*m_canvas);
       }
-      #endif
       m_needsPaint = false;
     }
 

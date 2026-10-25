@@ -581,19 +581,16 @@ private:
     if (style.width.unit == css::Length::Unit::Auto) {
       if (box->type() == BoxType::InlineBlockNode || style.cssFloat != css::Float::None ||
           style.position == css::Position::Absolute || style.position == css::Position::Fixed) {
-          // Shrink-to-fit (MaxContent width) - for now, fallback to auto = content size later,
-          // but we can't fully calculate it here without a pre-pass.
-          // By leaving it as 0 here, it will take the width of its children during layoutBlock if we allow it,
-          // but our engine expects width to be calculated before layoutBlock.
-          // A simple approximation for now is to let it be 0 and have a later pass fix it, OR we just use a small fallback?
-          // Actually, our engine might not have a max-content pass. Let's look at flexbox algorithm, how does it do max-content?
-          // For now, let's just let it expand to available width if we can't shrink-to-fit, or maybe let's check what test expects.
-          // Wait, if we set width = 0, maybe layoutBlock will update content.width if it's 0?
-          // Let's set it to 0 for now. Actually, if we set width = parentDim.content.width, it takes full width!
-          // We can set it to parentDim.content.width but shrink it after layoutBlock?
+          // Shrink-to-fit approximation: use the available width. A real
+          // implementation would need a max-content pre-pass.
           width = parentDim.content.width;
       } else {
-        width = parentDim.content.width;
+        // Block-level auto width fills the containing block minus this box's
+        // own margins, borders and padding (CSS 10.3.3)
+        float used = style.marginLeft.value + style.marginRight.value +
+                     style.borderLeftWidth.value + style.borderRightWidth.value +
+                     style.paddingLeft.value + style.paddingRight.value;
+        width = std::max(0.0f, parentDim.content.width - used);
       }
     } else if (style.width.unit == css::Length::Unit::Percent) {
       width = parentDim.content.width * (style.width.value / 100.0f);

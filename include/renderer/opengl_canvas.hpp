@@ -56,6 +56,9 @@ public:
 
   // OpenGL-specific methods
   GLuint getTexture() const { return texture_; }
+  // False when the framebuffer/texture could not be created (missing GL
+  // extensions, incomplete FBO); GL drawing must not run then
+  bool isReady() const { return glReady_; }
   void bindTexture();
   void unbindTexture();
 
@@ -64,6 +67,7 @@ private:
   int height_;
   GLuint texture_ = 0;
   GLuint framebuffer_ = 0;
+  bool glReady_ = false;
   GLuint renderbuffer_ = 0;
   
   // For software fallback (when OpenGL is not available)

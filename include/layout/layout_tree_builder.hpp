@@ -63,10 +63,23 @@ public:
         }
       }
     } else if (node->nodeType() == dom::NodeType::Text) {
-      // Text nodes inherit display context, treating as inline for now
+      // An anonymous text box only inherits inheritable properties. Copying
+      // the parent's whole style gave text the parent's float, width,
+      // margins, padding and borders (a float on a text box removes it from
+      // the IFC, and padded text boxes inflated their container).
       display = css::Display::Inline;
       if (parentStyle) {
-        style = *parentStyle;
+        style.color = parentStyle->color;
+        style.fontFamily = parentStyle->fontFamily;
+        style.fontSize = parentStyle->fontSize;
+        style.lineHeight = parentStyle->lineHeight;
+        style.textIndent = parentStyle->textIndent;
+        style.whiteSpace = parentStyle->whiteSpace;
+        style.letterSpacing = parentStyle->letterSpacing;
+        style.wordSpacing = parentStyle->wordSpacing;
+        style.textTransform = parentStyle->textTransform;
+        style.textAlign = parentStyle->textAlign;
+        style.textDecorationLine = parentStyle->textDecorationLine;
       }
     }
 

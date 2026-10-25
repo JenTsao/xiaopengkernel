@@ -355,9 +355,28 @@ void BitmapCanvas::drawTextVector(int x, int y, const std::string &text,
         penX + font->ftFace->glyph->bitmap_left + (glyph.x_offset >> 6);
     int glyphY = penY - font->ftFace->glyph->bitmap_top - (glyph.y_offset >> 6);
 
+    // The buffer layout depends on the pixel mode: mono fonts (common for
+    // CJK at small sizes) pack 8 pixels per byte, and the old code read
+    // width bytes per row, past the end of the glyph bitmap
+    const int pitch = bitmap.pitch;
     for (unsigned int row = 0; row < bitmap.rows; ++row) {
+      const unsigned char *line = bitmap.buffer + row * pitch;
       for (unsigned int col = 0; col < bitmap.width; ++col) {
-        uint8_t alpha = bitmap.buffer[row * bitmap.pitch + col];
+        int alpha = 0;
+        switch (bitmap.pixel_mode) {
+        case FT_PIXEL_MODE_MONO:
+          alpha = (line[col >> 3] & (0x80 >> (col & 7))) ? 255 : 0;
+          break;
+        case FT_PIXEL_MODE_GRAY:
+          alpha = line[col];
+          break;
+        case FT_PIXEL_MODE_BGRA:
+          alpha = line[col * 4 + 3];
+          break;
+        default:
+          alpha = 0;
+          break;
+        }
         if (alpha > 0) {
           Color c = color;
           // Modulate alpha
@@ -378,7 +397,7 @@ void BitmapCanvas::drawTextVector(int x, int y, const std::string &text,
 
 void BitmapCanvas::drawImage(const Image &image, int x, int y, int destW,
                              int destH) {
-  if (!image.isValid())
+  if (!image.isValid() || destW <= 0 || destH <= 0)
     return;
 
   // Simple nearest neighbor scaling
@@ -428,9 +447,11 @@ void BitmapCanvas::fillRect(int x, int y, int w, int h, Color color) {
   intersectWithClip(cx, cy, cw, ch);
   if (cw <= 0 || ch <= 0)
     return;
+  // blendPixel keeps alpha: semi-transparent backgrounds/borders used to
+  // overwrite the pixels and keep their source alpha
   for (int j = cy; j < cy + ch; ++j) {
     for (int i = cx; i < cx + cw; ++i) {
-      setPixel(i, j, color);
+      blendPixel(i, j, color);
     }
   }
 }

@@ -142,10 +142,9 @@ void SdlWindow::drawBuffer(const xiaopeng::renderer::BitmapCanvas &canvas) {
 void SdlWindow::drawOpenGLTexture(GLuint texture) {
 #ifdef ENABLE_SDL
 #ifdef ENABLE_OPENGL
-  if (!m_isOpen)
+  if (!m_isOpen || texture == 0)
     return;
 
-  (void)texture; // Used by glBindTexture below
   // Bind the texture
   glBindTexture(GL_TEXTURE_2D, texture);
 
@@ -160,17 +159,24 @@ void SdlWindow::drawOpenGLTexture(GLuint texture) {
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
 
-  // Draw a quad with the texture
+  // Draw a quad with the texture. The framebuffer is rendered with y down,
+  // so texel row 0 is the bottom of the image: flip v or the window shows
+  // the frame upside down.
   glBegin(GL_QUADS);
-  glTexCoord2f(0, 0);
-  glVertex2f(0, 0);
-  glTexCoord2f(1, 0);
-  glVertex2f(m_width, 0);
-  glTexCoord2f(1, 1);
-  glVertex2f(m_width, m_height);
   glTexCoord2f(0, 1);
+  glVertex2f(0, 0);
+  glTexCoord2f(1, 1);
+  glVertex2f(m_width, 0);
+  glTexCoord2f(1, 0);
+  glVertex2f(m_width, m_height);
+  glTexCoord2f(0, 0);
   glVertex2f(0, m_height);
   glEnd();
+
+  // Leave clean state: the canvas texture must not modulate the next
+  // frame's solid-colour quads
+  glDisable(GL_TEXTURE_2D);
+  glBindTexture(GL_TEXTURE_2D, 0);
 
   // Swap buffers
   SDL_GL_SwapWindow(m_window);
