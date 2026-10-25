@@ -181,6 +181,9 @@ void BrowserEngine::onParseComplete(ParseResult result) {
                             std::make_move_iterator(result.stylesheet.rules.end()));
                             
   m_baseUrl = result.baseUrl;
+  // Relative <img src> values resolve against the same base as scripts/CSS
+  m_painter.setBaseUrl(m_baseUrl.empty() ? m_config.baseUrl : m_baseUrl);
+  m_painter.clearImageCache();
   m_resourceTree = result.resourceTree;
 
   // Wire up the mutation observer (main thread only)

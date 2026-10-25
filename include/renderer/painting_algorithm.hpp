@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "renderer/paint_layer.hpp"
 
@@ -22,8 +23,14 @@ class PaintingAlgorithm {
 public:
   void paint(layout::LayoutBoxPtr root, Canvas &canvas);
 
+  /// Document URL used to resolve relative <img src> values.
+  void setBaseUrl(const std::string &url) { baseUrl_ = url; }
+
   /// Clear the decoded-image cache (call on page reload / navigation).
-  void clearImageCache() { imageCache_.clear(); }
+  void clearImageCache() {
+    imageCache_.clear();
+    failedImages_.clear();
+  }
 
 private:
   PaintLayerPtr buildLayerTree(layout::LayoutBoxPtr root);
@@ -39,6 +46,10 @@ private:
 
   // Image cache: URL → decoded Image (avoids per-frame re-download/decode)
   std::unordered_map<std::string, std::shared_ptr<Image>> imageCache_;
+  // Sources that failed to load; retrying them every frame would block the
+  // main thread on the network timeout each time
+  std::unordered_set<std::string> failedImages_;
+  std::string baseUrl_;
 };
 
 } // namespace renderer

@@ -233,11 +233,22 @@ void PaintingAlgorithm::paintBox(layout::LayoutBoxPtr box, Canvas &canvas,
         if (attr.has_value() && !attr.value().empty()) {
           std::string src = attr.value();
 
+          // Resolve relative sources against the document URL; Url::parse
+          // rejects anything without a scheme
+          if (src.find("://") == std::string::npos && !baseUrl_.empty()) {
+            auto base = loader::Url::parse(baseUrl_);
+            if (base.isOk()) {
+              src = base.unwrap().resolve(src).toString();
+            }
+          }
+
           // Cache lookup — avoids per-frame network download + decode
           std::shared_ptr<Image> image;
           auto cacheIt = imageCache_.find(src);
           if (cacheIt != imageCache_.end()) {
             image = cacheIt->second;
+          } else if (failedImages_.find(src) != failedImages_.end()) {
+            image = nullptr; // do not retry a failed download every frame
           } else {
             image = loader::GetLoader().loadImage(src);
             if (image) {
@@ -245,6 +256,8 @@ void PaintingAlgorithm::paintBox(layout::LayoutBoxPtr box, Canvas &canvas,
               std::cout << "[Painter] Cached image: " << src << " ("
                         << image->width() << "x" << image->height() << ")"
                         << std::endl;
+            } else {
+              failedImages_.insert(src);
             }
           }
 
