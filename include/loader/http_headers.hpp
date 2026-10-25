@@ -229,9 +229,33 @@ public:
         set("authorization", "Bearer " + token);
     }
     
+    // RFC 7617: the credentials are "user:password" in base64
     void setBasicAuth(const std::string& username, const std::string& password) {
-        std::string credentials = username + ":" + password;
-        set("authorization", "Basic " + credentials);
+        static const char kAlphabet[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const std::string credentials = username + ":" + password;
+        std::string encoded;
+        size_t i = 0;
+        for (; i + 2 < credentials.size(); i += 3) {
+            uint32_t n = (static_cast<uint8_t>(credentials[i]) << 16) |
+                         (static_cast<uint8_t>(credentials[i + 1]) << 8) |
+                         static_cast<uint8_t>(credentials[i + 2]);
+            encoded += kAlphabet[(n >> 18) & 63];
+            encoded += kAlphabet[(n >> 12) & 63];
+            encoded += kAlphabet[(n >> 6) & 63];
+            encoded += kAlphabet[n & 63];
+        }
+        if (i < credentials.size()) {
+            uint32_t n = static_cast<uint8_t>(credentials[i]) << 16;
+            const bool two = i + 1 < credentials.size();
+            if (two)
+                n |= static_cast<uint8_t>(credentials[i + 1]) << 8;
+            encoded += kAlphabet[(n >> 18) & 63];
+            encoded += kAlphabet[(n >> 12) & 63];
+            encoded += two ? kAlphabet[(n >> 6) & 63] : '=';
+            encoded += '=';
+        }
+        set("authorization", "Basic " + encoded);
     }
     
     std::string cookie() const {

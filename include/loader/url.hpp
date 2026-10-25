@@ -146,56 +146,65 @@ public:
     if (!valid_)
       return Url();
 
-    if (relative.empty())
-      return *this;
-
+    // Absolute URL (has a scheme)
     auto parsed = Url::parse(relative);
-    if (parsed.isOk()) {
+    if (parsed.isOk())
       return parsed.unwrap();
-    }
 
-    if (relative[0] == '/') {
-      Url result = *this;
-      if (relative.size() > 1 && relative[1] == '/') {
-        // Network-path reference: //host/path
-        // Re-parse with same scheme
-        Url temp = Url(schemeStr_ + ":" + relative);
-        if (temp.isValid()) {
-          return temp;
-        }
-        // Fallback if parse failed (unlikely)
-        result.host_ = relative.substr(2);
-        result.path_ = "/";
-      } else {
-        result.path_ = relative;
-      }
-      return result;
+    // RFC 3986 §5.2.2: split the reference into path, query and fragment
+    // first; resolving the whole string as a path folds "?y" into the path
+    std::string ref = relative;
+    std::string refQuery;
+    std::string refFragment;
+    size_t hash = ref.find('#');
+    const bool hasFragment = hash != std::string::npos;
+    if (hasFragment) {
+      refFragment = ref.substr(hash + 1);
+      ref.erase(hash);
     }
-
-    if (relative[0] == '?') {
-      Url result = *this;
-      result.query_ = relative.substr(1);
-      result.fragment_.clear();
-      return result;
-    }
-
-    if (relative[0] == '#') {
-      Url result = *this;
-      result.fragment_ = relative.substr(1);
-      return result;
+    size_t question = ref.find('?');
+    const bool hasQuery = question != std::string::npos;
+    if (hasQuery) {
+      refQuery = ref.substr(question + 1);
+      ref.erase(question);
     }
 
     Url result = *this;
-    size_t lastSlash = result.path_.rfind('/');
-    if (lastSlash != std::string::npos) {
-      result.path_ = result.path_.substr(0, lastSlash + 1) + relative;
-    } else {
-      result.path_ = "/" + relative;
-    }
-    result.query_.clear();
     result.fragment_.clear();
 
-    return normalizePath(result);
+    if (ref.size() >= 2 && ref[0] == '/' && ref[1] == '/') {
+      // Network-path reference: keep the scheme, replace the authority
+      Url temp(schemeStr_ + ":" + ref + (hasQuery ? "?" + refQuery : "") +
+               (hasFragment ? "#" + refFragment : ""));
+      return temp;
+    }
+
+    if (ref.empty()) {
+      // "" and "#s" keep the base path and query; "?y" replaces the query
+      if (hasQuery)
+        result.query_ = refQuery;
+    } else {
+      if (ref[0] == '/') {
+        result.path_ = removeDotSegments(ref);
+      } else {
+        // Merge with the base path (§5.2.3)
+        size_t slash = result.path_.rfind('/');
+        result.path_ =
+            removeDotSegments((slash == std::string::npos
+                                   ? std::string()
+                                   : result.path_.substr(0, slash + 1)) +
+                              ref);
+      }
+      if (hasQuery)
+        result.query_ = refQuery;
+      else
+        result.query_.clear();
+    }
+
+    if (hasFragment)
+      result.fragment_ = refFragment;
+
+    return result;
   }
 
   static std::string encode(const std::string &input) {
@@ -223,16 +232,13 @@ public:
     result.reserve(input.size());
 
     for (size_t i = 0; i < input.size(); ++i) {
-      if (input[i] == '%' && i + 2 < input.size()) {
-        std::string hex = input.substr(i + 1, 2);
-        try {
-          int value = std::stoi(hex, nullptr, 16);
-          result += static_cast<char>(value);
-          i += 2;
-        } catch (...) {
-          result += input[i];
-          // Do not increment i by 2 here, so next char is processed normally
-        }
+      // "%4G" is not an escape: decode nothing instead of turning "%4" + "G"
+      // into "\x04" and swallowing the G
+      if (input[i] == '%' && i + 2 < input.size() && isHexDigit(input[i + 1]) &&
+          isHexDigit(input[i + 2])) {
+        int value = hexValue(input[i + 1]) * 16 + hexValue(input[i + 2]);
+        result += static_cast<char>(value);
+        i += 2;
       } else if (input[i] == '+') {
         result += ' ';
       } else {
@@ -254,6 +260,39 @@ public:
   }
 
 private:
+  static bool isHexDigit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+  }
+
+  static int hexValue(char c) {
+    if (c >= '0' && c <= '9')
+      return c - '0';
+    if (c >= 'a' && c <= 'f')
+      return c - 'a' + 10;
+    return c - 'A' + 10;
+  }
+
+  // Scheme-relative port: empty means the default, digits only, <= 65535
+  bool parsePort(const std::string &text) {
+    if (text.empty()) {
+      port_ = defaultPort();
+      return true;
+    }
+    if (text.size() > 5)
+      return false;
+    std::uint32_t value = 0;
+    for (char c : text) {
+      if (c < '0' || c > '9')
+        return false;
+      value = value * 10 + static_cast<std::uint32_t>(c - '0');
+    }
+    if (value > 65535)
+      return false;
+    port_ = static_cast<std::uint16_t>(value);
+    return true;
+  }
+
   bool parseInternal(const std::string &url) {
     valid_ = false;
 
@@ -270,46 +309,57 @@ private:
                    ::tolower);
     scheme_ = parseScheme(schemeStr_);
 
-    size_t hostStart = schemeEnd + 3;
-    size_t pathStart = url.find('/', hostStart);
+    const size_t hostStart = schemeEnd + 3;
+
+    // A '?' inside the fragment is not the query separator, and a '/' inside
+    // the query/fragment is not the path separator. Finding them without
+    // those bounds made pathEnd < pathStart and underflow the substring.
+    const size_t fragmentStart = url.find('#', hostStart);
+    const size_t queryLimit =
+        fragmentStart == std::string::npos ? url.size() : fragmentStart;
     size_t queryStart = url.find('?', hostStart);
-    size_t fragmentStart = url.find('#', hostStart);
+    if (queryStart != std::string::npos && queryStart > queryLimit)
+      queryStart = std::string::npos;
+    const size_t pathLimit =
+        std::min(queryLimit, queryStart == std::string::npos ? url.size()
+                                                             : queryStart);
+    size_t pathStart = url.find('/', hostStart);
+    if (pathStart != std::string::npos && pathStart > pathLimit)
+      pathStart = std::string::npos;
 
-    size_t authorityEnd = url.size();
-    if (pathStart != std::string::npos)
-      authorityEnd = std::min(authorityEnd, pathStart);
-    if (queryStart != std::string::npos)
-      authorityEnd = std::min(authorityEnd, queryStart);
-    if (fragmentStart != std::string::npos)
-      authorityEnd = std::min(authorityEnd, fragmentStart);
-
+    const size_t authorityEnd =
+        pathStart != std::string::npos ? pathStart : pathLimit;
     std::string authority = url.substr(hostStart, authorityEnd - hostStart);
 
-    size_t atPos = authority.find('@');
+    // The last '@' separates userinfo from the host (WHATWG)
+    size_t atPos = authority.rfind('@');
     if (atPos != std::string::npos) {
       userinfo_ = authority.substr(0, atPos);
       authority = authority.substr(atPos + 1);
     }
 
-    size_t colonPos = authority.rfind(':');
-    size_t bracketPos = authority.rfind(']');
-
-    if (colonPos != std::string::npos &&
-        (bracketPos == std::string::npos || colonPos > bracketPos)) {
-      host_ = authority.substr(0, colonPos);
-      try {
-        port_ = static_cast<std::uint16_t>(
-            std::stoi(authority.substr(colonPos + 1)));
-      } catch (...) {
+    host_.clear();
+    port_ = defaultPort();
+    if (!authority.empty() && authority[0] == '[') {
+      // IPv6 literal: keep the brackets so serialization round-trips
+      size_t close = authority.find(']');
+      if (close == std::string::npos)
         return false;
+      host_ = authority.substr(0, close + 1);
+      if (close + 1 < authority.size()) {
+        if (authority[close + 1] != ':' ||
+            !parsePort(authority.substr(close + 2)))
+          return false;
       }
     } else {
-      host_ = authority;
-      port_ = defaultPort();
-    }
-
-    if (!host_.empty() && host_[0] == '[' && host_.back() == ']') {
-      host_ = host_.substr(1, host_.size() - 2);
+      size_t colonPos = authority.rfind(':');
+      if (colonPos != std::string::npos) {
+        host_ = authority.substr(0, colonPos);
+        if (!parsePort(authority.substr(colonPos + 1)))
+          return false;
+      } else {
+        host_ = authority;
+      }
     }
 
     if (host_.empty() && scheme_ != UrlScheme::File &&
@@ -317,28 +367,20 @@ private:
       return false;
     }
 
-    if (pathStart != std::string::npos && pathStart < authorityEnd) {
-      pathStart = authorityEnd;
-    }
-
-    if (pathStart != std::string::npos && pathStart < url.size()) {
-      size_t pathEnd = url.size();
-      if (queryStart != std::string::npos)
-        pathEnd = std::min(pathEnd, queryStart);
-      if (fragmentStart != std::string::npos)
-        pathEnd = std::min(pathEnd, fragmentStart);
-      path_ = url.substr(pathStart, pathEnd - pathStart);
+    if (pathStart != std::string::npos) {
+      path_ = url.substr(pathStart, pathLimit - pathStart);
     } else {
       path_ = "/";
     }
 
-    if (queryStart != std::string::npos && queryStart + 1 < url.size()) {
-      size_t queryEnd =
-          fragmentStart != std::string::npos ? fragmentStart : url.size();
-      query_ = url.substr(queryStart + 1, queryEnd - queryStart - 1);
+    if (queryStart != std::string::npos) {
+      size_t queryEnd = fragmentStart == std::string::npos ? url.size()
+                                                           : fragmentStart;
+      if (queryStart + 1 <= queryEnd)
+        query_ = url.substr(queryStart + 1, queryEnd - queryStart - 1);
     }
 
-    if (fragmentStart != std::string::npos && fragmentStart + 1 < url.size()) {
+    if (fragmentStart != std::string::npos) {
       fragment_ = url.substr(fragmentStart + 1);
     }
 
@@ -368,38 +410,50 @@ private:
     return UrlScheme::Unknown;
   }
 
-  static Url normalizePath(Url url) {
-    std::vector<std::string> segments;
-    std::string path = url.path_;
+  // RFC 3986 §5.2.4 "remove_dot_segments"; keeps an existing trailing slash
+  static std::string removeDotSegments(const std::string &path) {
+    std::string input = path;
+    std::string output;
 
-    if (path.empty() || path[0] != '/') {
-      path = "/" + path;
-    }
+    auto dropLastSegment = [&output]() {
+      if (output.empty())
+        return;
+      size_t slash = output.rfind('/');
+      if (slash == std::string::npos)
+        output.clear();
+      else
+        output.erase(slash);
+    };
 
-    std::istringstream iss(path);
-    std::string segment;
-
-    while (std::getline(iss, segment, '/')) {
-      if (segment.empty() || segment == ".") {
-        continue;
-      } else if (segment == "..") {
-        if (!segments.empty()) {
-          segments.pop_back();
-        }
+    while (!input.empty()) {
+      if (input.compare(0, 3, "../") == 0) {
+        input.erase(0, 3);
+      } else if (input.compare(0, 2, "./") == 0) {
+        input.erase(0, 2);
+      } else if (input.compare(0, 3, "/./") == 0) {
+        input.erase(0, 2);
+      } else if (input == "/.") {
+        input = "/";
+      } else if (input.compare(0, 4, "/../") == 0) {
+        input.erase(0, 3);
+        dropLastSegment();
+      } else if (input == "/..") {
+        input = "/";
+        dropLastSegment();
+      } else if (input == "." || input == "..") {
+        input.clear();
       } else {
-        segments.push_back(segment);
+        size_t next = input.find('/', input[0] == '/' ? 1 : 0);
+        if (next == std::string::npos) {
+          output += input;
+          input.clear();
+        } else {
+          output.append(input, 0, next);
+          input.erase(0, next);
+        }
       }
     }
-
-    std::string normalized = "/";
-    for (size_t i = 0; i < segments.size(); ++i) {
-      if (i > 0)
-        normalized += "/";
-      normalized += segments[i];
-    }
-
-    url.path_ = normalized;
-    return url;
+    return output;
   }
 
   UrlScheme scheme_ = UrlScheme::Unknown;

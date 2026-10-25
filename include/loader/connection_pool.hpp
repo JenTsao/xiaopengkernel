@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <algorithm>
 
 namespace xiaopeng {
 namespace loader {
@@ -63,40 +64,38 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         
         while (true) {
-            auto& hostPool = pools_[key];
-            
-            for (auto& conn : hostPool) {
-                if (!conn->inUse) {
-                    conn->inUse = true;
-                    conn->lastUsed = std::chrono::steady_clock::now();
-                    return conn;
+            // Look the pool up on every pass: cleanup can erase it, so a
+            // reference held across cleanupIdleConnectionsLocked() dangles
+            auto it = pools_.find(key);
+            if (it != pools_.end()) {
+                for (auto& conn : it->second) {
+                    if (!conn->inUse) {
+                        conn->inUse = true;
+                        conn->lastUsed = std::chrono::steady_clock::now();
+                        return conn;
+                    }
                 }
             }
+            const size_t hostCount = it == pools_.end() ? 0 : it->second.size();
             
-            if (hostPool.size() < config_.maxConnectionsPerHost && 
+            if (hostCount < config_.maxConnectionsPerHost && 
                 totalConnections_ < config_.maxTotalConnections) {
-                auto conn = std::make_shared<Connection>(key, nextId_++);
-                conn->inUse = true;
-                hostPool.push_back(conn);
-                ++totalConnections_;
-                return conn;
+                return createConnectionLocked(key);
             }
             
-            if (hostPool.size() >= config_.maxConnectionsPerHost) {
+            if (hostCount >= config_.maxConnectionsPerHost) {
+                // Every connection to this host is in use
                 cv_.wait(lock);
                 continue;
             }
             
-            cleanupIdleConnectionsLocked();
-            
-            if (totalConnections_ < config_.maxTotalConnections) {
-                auto conn = std::make_shared<Connection>(key, nextId_++);
-                conn->inUse = true;
-                hostPool.push_back(conn);
-                ++totalConnections_;
-                return conn;
+            // The host has room but the pool is at the total cap: reuse the
+            // slot of the least recently used idle connection
+            if (evictOldestIdleLocked()) {
+                return createConnectionLocked(key);
             }
             
+            // Every connection everywhere is in use; release() wakes us
             cv_.wait(lock);
         }
     }
@@ -107,7 +106,8 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         connection->inUse = false;
         connection->lastUsed = std::chrono::steady_clock::now();
-        cv_.notify_one();
+        // Several hosts may be waiting for a slot
+        cv_.notify_all();
     }
     
     void cleanupIdleConnections() {
@@ -119,6 +119,7 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         pools_.clear();
         totalConnections_ = 0;
+        cv_.notify_all();
     }
     
     size_t totalConnections() const {
@@ -156,6 +157,43 @@ public:
     }
 
 private:
+    Ptr<Connection> createConnectionLocked(const ConnectionKey& key) {
+        auto conn = std::make_shared<Connection>(key, nextId_++);
+        conn->inUse = true;
+        pools_[key].push_back(conn);
+        ++totalConnections_;
+        return conn;
+    }
+    
+    // Drop the least recently used idle connection; false when none is idle
+    bool evictOldestIdleLocked() {
+        Ptr<Connection> oldest;
+        for (auto& entry : pools_) {
+            for (auto& conn : entry.second) {
+                if (!conn->inUse &&
+                    (!oldest || conn->lastUsed < oldest->lastUsed)) {
+                    oldest = conn;
+                }
+            }
+        }
+        if (!oldest) return false;
+        
+        for (auto it = pools_.begin(); it != pools_.end(); ) {
+            auto& pool = it->second;
+            auto connIt = std::find(pool.begin(), pool.end(), oldest);
+            if (connIt != pool.end()) {
+                pool.erase(connIt);
+                --totalConnections_;
+                if (pool.empty()) {
+                    pools_.erase(it);
+                }
+                return true;
+            }
+            ++it;
+        }
+        return false;
+    }
+    
     void cleanupIdleConnectionsLocked() {
         auto now = std::chrono::steady_clock::now();
         

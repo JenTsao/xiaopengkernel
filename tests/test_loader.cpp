@@ -91,6 +91,96 @@ TEST(UrlEncode_Decode) {
   EXPECT_STREQ("a=b&c=d", decoded.c_str());
 }
 
+// ── Regression: URL parsing / resolution ─────────────────────
+
+TEST(UrlParse_SeparatorsInsideFragments) {
+  {
+    // '/' after the query is part of the query, not the path
+    auto url = Url::parse("https://x.com?r=/home").unwrap();
+    EXPECT_STREQ("/", url.path().c_str());
+    EXPECT_STREQ("r=/home", url.query().c_str());
+  }
+  {
+    // '?' after '#' belongs to the fragment
+    auto url = Url::parse("http://a/p#f?q").unwrap();
+    EXPECT_STREQ("/p", url.path().c_str());
+    EXPECT_TRUE(url.query().empty());
+    EXPECT_STREQ("f?q", url.fragment().c_str());
+  }
+  {
+    auto url = Url::parse("http://a:8080/p?q=1#f").unwrap();
+    EXPECT_EQ(8080, url.port());
+    EXPECT_STREQ("/p", url.path().c_str());
+    EXPECT_STREQ("q=1", url.query().c_str());
+    EXPECT_STREQ("f", url.fragment().c_str());
+  }
+}
+
+TEST(UrlParse_PortValidation) {
+  EXPECT_TRUE(Url::parse("http://a:99999/").isErr());
+  EXPECT_TRUE(Url::parse("http://a:-1/").isErr());
+  EXPECT_TRUE(Url::parse("http://a:80abc/").isErr());
+  auto empty = Url::parse("http://a:/x");
+  EXPECT_TRUE(empty.isOk());
+  EXPECT_EQ(80, empty.unwrap().port());
+  EXPECT_EQ(0, Url::parse("http://a:0/").unwrap().port());
+}
+
+TEST(UrlParse_UserInfoAndIpv6) {
+  {
+    auto url = Url::parse("http://u@x@h/p").unwrap();
+    EXPECT_STREQ("u@x", url.userinfo().c_str());
+    EXPECT_STREQ("h", url.host().c_str());
+  }
+  {
+    // brackets stay so serialization round-trips
+    auto url = Url::parse("http://[::1]:8080/x").unwrap();
+    EXPECT_STREQ("[::1]", url.host().c_str());
+    EXPECT_EQ(8080, url.port());
+    EXPECT_STREQ("http://[::1]:8080/x", url.toString().c_str());
+    EXPECT_STREQ("http://[::1]:8080", url.origin().c_str());
+  }
+}
+
+TEST(UrlDecode_InvalidEscapes) {
+  EXPECT_STREQ("%4G", Url::decode("%4G").c_str());
+  EXPECT_STREQ("%", Url::decode("%").c_str());
+  EXPECT_STREQ("%4", Url::decode("%4").c_str());
+  EXPECT_STREQ("A", Url::decode("%41").c_str());
+}
+
+TEST(UrlResolve_Rfc3986ReferenceExamples) {
+  auto base = Url::parse("http://a/b/c/d;p?q").unwrap();
+  auto check = [&](const std::string &ref, const std::string &path,
+                   const std::string &query) {
+    auto r = base.resolve(ref);
+    EXPECT_TRUE(r.isValid());
+    EXPECT_STREQ(path.c_str(), r.path().c_str());
+    EXPECT_STREQ(query.c_str(), r.query().c_str());
+  };
+
+  check("g", "/b/c/g", "");
+  check("./g", "/b/c/g", "");
+  check("g/", "/b/c/g/", "");
+  check("/g", "/g", "");
+  check("?y", "/b/c/d;p", "y");
+  check("g?y", "/b/c/g", "y");
+  check("#s", "/b/c/d;p", "q");
+  check("", "/b/c/d;p", "q");
+  check(".", "/b/c/", "");
+  check("..", "/b/", "");
+  check("../g", "/b/g", "");
+  check("../../../g", "/g", "");
+  check("g;x?y", "/b/c/g;x", "y");
+
+  auto fragment = base.resolve("#s");
+  EXPECT_STREQ("s", fragment.fragment().c_str());
+
+  auto network = base.resolve("//g/x");
+  EXPECT_STREQ("g", network.host().c_str());
+  EXPECT_STREQ("/x", network.path().c_str());
+}
+
 TEST(HttpHeaders_SetAndGet) {
   HttpHeaders headers;
   headers.set("Content-Type", "application/json");
@@ -479,6 +569,180 @@ TEST(Loader_SchedulerStats) {
   auto stats = loader.schedulerStats();
   // Use GE because other tests might have run tasks
   EXPECT_GE(stats.totalTasks, 0);
+}
+
+// ── Regression: caching, CORS, CSP ───────────────────────────
+
+TEST(Cache_FreshnessRules) {
+  auto url = Url::parse("https://example.com/no-cache").unwrap();
+  {
+    HttpResponse response;
+    response.statusCode = HttpStatusCode::Ok;
+    response.body = ByteBuffer{'x'};
+    response.headers.set("Cache-Control", "no-cache");
+    HttpCache cache;
+    cache.put(url, response);
+    auto cached = cache.get(url);
+    ASSERT_TRUE(cached.has_value());
+    EXPECT_FALSE(cached->isFresh());
+    EXPECT_TRUE(cached->needsRevalidation());
+  }
+  {
+    // max-age=0 is stale right away
+    HttpResponse response;
+    response.statusCode = HttpStatusCode::Ok;
+    response.body = ByteBuffer{'x'};
+    response.headers.set("Cache-Control", "max-age=0");
+    HttpCache cache;
+    cache.put(url, response);
+    EXPECT_FALSE(cache.get(url)->isFresh());
+  }
+  {
+    // no freshness information and no validator: do not trust it for an hour
+    HttpResponse response;
+    response.statusCode = HttpStatusCode::Ok;
+    response.body = ByteBuffer{'x'};
+    HttpCache cache;
+    cache.put(url, response);
+    EXPECT_FALSE(cache.get(url)->isFresh());
+  }
+  {
+    // Expires in the past is stale
+    HttpResponse response;
+    response.statusCode = HttpStatusCode::Ok;
+    response.body = ByteBuffer{'x'};
+    response.headers.set("Expires", "Sun, 06 Nov 1994 08:49:37 GMT");
+    HttpCache cache;
+    cache.put(url, response);
+    EXPECT_FALSE(cache.get(url)->isFresh());
+  }
+  {
+    // Age consumes the freshness lifetime
+    HttpResponse response;
+    response.statusCode = HttpStatusCode::Ok;
+    response.body = ByteBuffer{'x'};
+    response.headers.set("Cache-Control", "max-age=60");
+    response.headers.set("Age", "120");
+    HttpCache cache;
+    cache.put(url, response);
+    EXPECT_FALSE(cache.get(url)->isFresh());
+  }
+  {
+    // ... but a normal max-age is fresh
+    HttpResponse response;
+    response.statusCode = HttpStatusCode::Ok;
+    response.body = ByteBuffer{'x'};
+    response.headers.set("Cache-Control", "max-age=60");
+    response.headers.set("Age", "10");
+    HttpCache cache;
+    cache.put(url, response);
+    EXPECT_TRUE(cache.get(url)->isFresh());
+  }
+}
+
+TEST(HttpHeaders_BasicAuthIsBase64) {
+  HttpHeaders headers;
+  headers.setBasicAuth("Aladdin", "open sesame");
+  EXPECT_STREQ("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+               headers.get("authorization").value_or("").c_str());
+
+  HttpHeaders one;
+  one.setBasicAuth("a", "b"); // "a:b" → YTpi
+  EXPECT_STREQ("Basic YTpi", one.get("authorization").value_or("").c_str());
+}
+
+TEST(Cors_CredentialsAndExactTokens) {
+  auto origin = Origin::parse("https://app.example.com");
+  CorsChecker checker;
+  HttpRequest request;
+
+  {
+    HttpResponse wildcard;
+    wildcard.headers.set("Access-Control-Allow-Origin", "*");
+    // "*" cannot be used for a credentialed request
+    EXPECT_TRUE(checker.checkActualRequest(request, wildcard, origin, true) ==
+                CorsResult::Failure);
+    EXPECT_TRUE(checker.checkActualRequest(request, wildcard, origin) ==
+                CorsResult::Success);
+  }
+  {
+    HttpResponse exact;
+    exact.headers.set("Access-Control-Allow-Origin",
+                      "https://app.example.com");
+    EXPECT_TRUE(checker.checkActualRequest(request, exact, origin, true) ==
+                CorsResult::Failure); // missing Allow-Credentials
+    exact.headers.set("Access-Control-Allow-Credentials", "true");
+    EXPECT_TRUE(checker.checkActualRequest(request, exact, origin, true) ==
+                CorsResult::Success);
+  }
+  {
+    // Method and header lists are exact, not substrings
+    HttpResponse preflight;
+    preflight.headers.set("Access-Control-Allow-Origin",
+                          "https://app.example.com");
+    preflight.headers.set("Access-Control-Allow-Methods", "PUT");
+    preflight.headers.set("Access-Control-Allow-Headers", "x-api-key-id");
+    HttpRequest ask;
+    ask.headers.set("Access-Control-Request-Method", "P");
+    EXPECT_TRUE(checker.checkPreflight(ask, preflight, origin) ==
+                CorsResult::Failure);
+    HttpRequest put;
+    put.headers.set("Access-Control-Request-Method", "PUT");
+    EXPECT_TRUE(checker.checkPreflight(put, preflight, origin) ==
+                CorsResult::Success);
+    HttpRequest headers;
+    headers.headers.set("Access-Control-Request-Headers", "x-api-key");
+    EXPECT_TRUE(checker.checkPreflight(headers, preflight, origin) ==
+                CorsResult::Failure);
+    HttpRequest exactHeader;
+    exactHeader.headers.set("Access-Control-Request-Headers", "x-api-key-id");
+    EXPECT_TRUE(checker.checkPreflight(exactHeader, preflight, origin) ==
+                CorsResult::Success);
+  }
+}
+
+TEST(Csp_SourceMatching) {
+  auto self = Url::parse("https://site.example.com/page").unwrap();
+  auto sameOrigin = Url::parse("https://site.example.com/app.js").unwrap();
+  auto otherOrigin = Url::parse("https://evil.example.com/app.js").unwrap();
+  auto cdn = Url::parse("https://x.cdn.example.com/lib.js").unwrap();
+  auto bareDomain = Url::parse("https://cdn.example.com/lib.js").unwrap();
+  auto plainHttp = Url::parse("http://site.example.com/app.js").unwrap();
+
+  ContentSecurity cs;
+  cs.parse("script-src 'self'");
+  // 'self' needs the document origin; without it nothing matches
+  EXPECT_FALSE(cs.isScriptAllowed(sameOrigin));
+  cs.setSelfOrigin(Origin(self));
+  EXPECT_TRUE(cs.isScriptAllowed(sameOrigin));
+  EXPECT_FALSE(cs.isScriptAllowed(otherOrigin));
+  EXPECT_FALSE(cs.isScriptAllowed(plainHttp));
+
+  ContentSecurity wildcard;
+  wildcard.parse("script-src *.cdn.example.com");
+  EXPECT_TRUE(wildcard.isScriptAllowed(cdn));
+  EXPECT_FALSE(wildcard.isScriptAllowed(bareDomain));
+
+  ContentSecurity scheme;
+  scheme.parse("script-src https:");
+  EXPECT_TRUE(scheme.isScriptAllowed(cdn));
+  EXPECT_FALSE(scheme.isScriptAllowed(plainHttp));
+
+  ContentSecurity host;
+  host.parse("script-src https://site.example.com");
+  EXPECT_TRUE(host.isScriptAllowed(sameOrigin));
+  EXPECT_FALSE(host.isScriptAllowed(cdn));
+
+  ContentSecurity port;
+  port.parse("script-src https://site.example.com:8443");
+  EXPECT_FALSE(port.isScriptAllowed(sameOrigin)); // default port 443
+
+  ContentSecurity path;
+  path.parse("script-src https://site.example.com/assets/");
+  EXPECT_TRUE(path.isScriptAllowed(
+      Url::parse("https://site.example.com/assets/app.js").unwrap()));
+  EXPECT_FALSE(
+      path.isScriptAllowed(Url::parse("https://site.example.com/other.js").unwrap()));
 }
 
 int main() {

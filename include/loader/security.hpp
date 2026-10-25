@@ -240,9 +240,12 @@ public:
   explicit CorsChecker(const SecurityPolicy &policy = SecurityPolicy{})
       : policy_(policy) {}
 
+  // credentials: whether the request's credentials mode is "include"
+  // (RFC 7234/WHATWG Fetch: "*" is not allowed then, and ACAC must be true)
   CorsResult checkPreflight(const HttpRequest &request,
                             const HttpResponse &response,
-                            const Origin &requestOrigin) const {
+                            const Origin &requestOrigin,
+                            bool credentials = false) const {
     if (!policy_.enforceCors) {
       return CorsResult::NotCors;
     }
@@ -252,7 +255,11 @@ public:
       return CorsResult::Failure;
     }
 
-    if (*allowOrigin != "*" && *allowOrigin != requestOrigin.toString()) {
+    const std::string origin = requestOrigin.toString();
+    if (*allowOrigin != "*" && *allowOrigin != origin) {
+      return CorsResult::Failure;
+    }
+    if (credentials && *allowOrigin == "*") {
       return CorsResult::Failure;
     }
 
@@ -296,7 +303,8 @@ public:
 
   CorsResult checkActualRequest(const HttpRequest &request,
                                 const HttpResponse &response,
-                                const Origin &requestOrigin) const {
+                                const Origin &requestOrigin,
+                                bool credentials = false) const {
     (void)request;
     if (!policy_.enforceCors) {
       return CorsResult::NotCors;
@@ -307,8 +315,19 @@ public:
       return CorsResult::Failure;
     }
 
-    if (*allowOrigin != "*" && *allowOrigin != requestOrigin.toString()) {
+    const std::string origin = requestOrigin.toString();
+    if (*allowOrigin != "*" && *allowOrigin != origin) {
       return CorsResult::Failure;
+    }
+
+    // A wildcard cannot be used with credentials
+    if (credentials) {
+      if (*allowOrigin == "*")
+        return CorsResult::Failure;
+      auto allowCredentials =
+          response.headers.get("access-control-allow-credentials");
+      if (!allowCredentials || *allowCredentials != "true")
+        return CorsResult::Failure;
     }
 
     auto varyHeader = response.headers.get("vary");
@@ -413,14 +432,26 @@ private:
     if (allowed == "*")
       return true;
 
-    std::string lower = allowed;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-
     std::string methodLower = method;
     std::transform(methodLower.begin(), methodLower.end(), methodLower.begin(),
                    ::tolower);
 
-    return lower.find(methodLower) != std::string::npos;
+    std::istringstream ss(allowed);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+      trimAsciiWhitespace(token);
+      std::transform(token.begin(), token.end(), token.begin(), ::tolower);
+      if (token == methodLower)
+        return true;
+    }
+    return false;
+  }
+
+  static void trimAsciiWhitespace(std::string &s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
+      s.erase(0, 1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))
+      s.pop_back();
   }
 
   static bool areHeadersAllowed(const std::string &headers,
@@ -428,25 +459,24 @@ private:
     if (allowed == "*")
       return true;
 
-    std::string allowedLower = allowed;
-    std::transform(allowedLower.begin(), allowedLower.end(),
-                   allowedLower.begin(), ::tolower);
+    // Exact (case-insensitive) list membership: a substring test let
+    // "x-api-key-id" allow "x-api-key"
+    std::set<std::string> allowedNames;
+    std::istringstream as(allowed);
+    std::string name;
+    while (std::getline(as, name, ',')) {
+      trimAsciiWhitespace(name);
+      std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+      allowedNames.insert(name);
+    }
 
     std::istringstream ss(headers);
     std::string header;
     while (std::getline(ss, header, ',')) {
-      while (!header.empty() &&
-             (header.front() == ' ' || header.front() == '\t')) {
-        header.erase(0, 1);
-      }
-      while (!header.empty() &&
-             (header.back() == ' ' || header.back() == '\t')) {
-        header.pop_back();
-      }
-
+      trimAsciiWhitespace(header);
       std::transform(header.begin(), header.end(), header.begin(), ::tolower);
 
-      if (allowedLower.find(header) == std::string::npos) {
+      if (allowedNames.find(header) == allowedNames.end()) {
         return false;
       }
     }
@@ -465,6 +495,11 @@ public:
   };
 
   ContentSecurity() = default;
+
+  // Origin of the protected document, used by the 'self' source and by
+  // scheme-less host sources
+  void setSelfOrigin(const Origin &origin) { selfOrigin_ = origin; }
+  const Origin &selfOrigin() const { return selfOrigin_; }
 
   void parse(const std::string &csp) {
     directives_.clear();
@@ -565,39 +600,107 @@ private:
     return false;
   }
 
+  // CSP3 §6.7.2 source expression matching
   bool matchesSource(const Url &url, const std::string &source) const {
     if (source == "*")
       return true;
     if (source == "'none'")
       return false;
     if (source == "'self'") {
-      return true;
+      // Without a document origin nothing can be proven same-origin
+      return selfOrigin_.isValid() && Origin(url).sameOrigin(selfOrigin_);
     }
-    if (source == "'unsafe-inline'" || source == "'unsafe-eval'") {
-      return false;
-    }
-
-    if (source.find("://") != std::string::npos) {
-      auto sourceUrl = Url::parse(source);
-      if (sourceUrl.isOk()) {
-        auto s = sourceUrl.unwrap();
-        return url.scheme() == s.scheme() && url.host() == s.host();
-      }
-    }
-
+    if (!source.empty() && source[0] == '\'')
+      return false; // 'unsafe-inline', 'unsafe-eval', 'nonce-…', hashes
     if (source.empty())
       return false;
 
-    if (source[0] == '.') {
-      std::string host = url.host();
-      return host.size() > source.size() &&
-             host.substr(host.size() - source.size()) == source.substr(1);
+    // Scheme source, e.g. "https:"
+    if (source.back() == ':') {
+      return url.schemeString() == source.substr(0, source.size() - 1);
     }
 
-    return url.host() == source;
+    // Host source: [scheme://]host[:port][/path], host may be "*.domain"
+    std::string rest = source;
+    std::string scheme;
+    size_t schemeEnd = rest.find("://");
+    if (schemeEnd != std::string::npos) {
+      scheme = rest.substr(0, schemeEnd);
+      rest = rest.substr(schemeEnd + 3);
+    }
+    std::string hostPart = rest;
+    std::string pathPrefix;
+    size_t slash = rest.find('/');
+    if (slash != std::string::npos) {
+      hostPart = rest.substr(0, slash);
+      pathPrefix = rest.substr(slash);
+    }
+
+    // Scheme-less sources use the document's scheme (https upgrades http)
+    if (scheme.empty()) {
+      if (selfOrigin_.isValid()) {
+        const std::string &selfScheme = selfOrigin_.scheme();
+        if (url.schemeString() != selfScheme &&
+            !(selfScheme == "http" && url.schemeString() == "https"))
+          return false;
+      }
+    } else if (url.schemeString() != scheme) {
+      return false;
+    }
+
+    std::string host = hostPart;
+    std::string port;
+    size_t colon = hostPart.rfind(':');
+    if (colon != std::string::npos) {
+      host = hostPart.substr(0, colon);
+      port = hostPart.substr(colon + 1);
+    }
+
+    std::string urlHost = url.host();
+    std::transform(urlHost.begin(), urlHost.end(), urlHost.begin(), ::tolower);
+    std::transform(host.begin(), host.end(), host.begin(), ::tolower);
+
+    bool hostMatches = false;
+    if (host.size() > 2 && host[0] == '*' && host[1] == '.') {
+      // "*.example.com" matches subdomains only, not example.com itself
+      const std::string suffix = host.substr(1); // ".example.com"
+      hostMatches = urlHost.size() > suffix.size() &&
+                    urlHost.compare(urlHost.size() - suffix.size(),
+                                    suffix.size(), suffix) == 0;
+    } else {
+      hostMatches = urlHost == host;
+    }
+    if (!hostMatches)
+      return false;
+
+    if (port.empty()) {
+      if (url.port() != url.defaultPort())
+        return false;
+    } else {
+      unsigned long value = 0;
+      try {
+        value = std::stoul(port);
+      } catch (...) {
+        return false;
+      }
+      if (value != url.port())
+        return false;
+    }
+
+    if (!pathPrefix.empty() && pathPrefix != "/") {
+      if (url.path().compare(0, pathPrefix.size(), pathPrefix) != 0)
+        return false;
+      // A prefix not ending in '/' must end on a path segment boundary
+      if (pathPrefix.back() != '/' && url.path().size() > pathPrefix.size() &&
+          url.path()[pathPrefix.size()] != '/')
+        return false;
+    }
+
+    return true;
   }
 
   std::vector<Directive> directives_;
+  Origin selfOrigin_;
 };
 
 } // namespace loader

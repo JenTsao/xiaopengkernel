@@ -41,9 +41,15 @@ public:
 
   /// Gracefully stop the worker thread and join.
   void stop() {
-    if (!running_.load())
-      return;
-    running_.store(false);
+    {
+      // Flip the flag under the mutex: notifying after an unlocked store can
+      // land between the worker's predicate check and its wait, and the lost
+      // wakeup makes join() hang forever
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!running_.load())
+        return;
+      running_.store(false);
+    }
     cv_.notify_all();
     if (thread_.joinable()) {
       thread_.join();

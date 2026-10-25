@@ -8,6 +8,7 @@
 #include "resource_handler.hpp"
 #include "types.hpp"
 #include "url.hpp"
+#include <atomic>
 #include <queue>
 #include <shared_mutex>
 
@@ -21,8 +22,10 @@ struct LoadTask {
   std::function<void(Result<Ptr<Resource>>)> callback;
   ResourcePriority priority = ResourcePriority::Medium;
   TimePoint createdAt;
-  bool cancelled = false;
+  // Written under the scheduler mutex but read by the worker without it
+  std::atomic<bool> cancelled{false};
 
+  // "a < b" means a runs after b: lower priority, or same priority but newer
   bool operator<(const LoadTask &other) const {
     if (priority != other.priority) {
       return static_cast<int>(priority) > static_cast<int>(other.priority);
@@ -31,9 +34,11 @@ struct LoadTask {
   }
 };
 
+// std::priority_queue keeps the greatest element on top, so the comparator
+// is plain "less": highest priority first, FIFO within a priority
 struct LoadTaskCompare {
   bool operator()(const Ptr<LoadTask> &a, const Ptr<LoadTask> &b) const {
-    return *b < *a;
+    return *a < *b;
   }
 };
 
@@ -140,15 +145,17 @@ public:
     return future.get();
   }
 
+  // Cancelled tasks still complete their callback with ResourceCancelled, so
+  // loadAsync() futures never end with a broken promise
   bool cancel(const std::string &taskId) {
     std::unique_lock<std::mutex> lock(mutex_);
 
     auto it = pendingMap_.find(taskId);
     if (it != pendingMap_.end()) {
+      // Still queued: the worker that dequeues it reports the cancellation
+      // and does the pending/cancelled accounting
       it->second->cancelled = true;
       pendingMap_.erase(it);
-      stats_.cancelledTasks++;
-      stats_.pendingTasks--;
       return true;
     }
 
@@ -162,21 +169,29 @@ public:
   }
 
   void cancelAll() {
-    std::unique_lock<std::mutex> lock(mutex_);
+    std::vector<Ptr<LoadTask>> dropped;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
 
-    while (!pendingTasks_.empty()) {
-      auto task = pendingTasks_.top();
-      pendingTasks_.pop();
-      task->cancelled = true;
-      stats_.cancelledTasks++;
+      while (!pendingTasks_.empty()) {
+        auto task = pendingTasks_.top();
+        pendingTasks_.pop();
+        task->cancelled = true;
+        stats_.cancelledTasks++;
+        dropped.push_back(task);
+      }
+
+      for (auto &[id, task] : activeTasks_) {
+        task->cancelled = true;
+      }
+
+      pendingMap_.clear();
+      stats_.pendingTasks = 0;
     }
 
-    for (auto &[id, task] : activeTasks_) {
-      task->cancelled = true;
+    for (auto &task : dropped) {
+      notifyCancelled(task);
     }
-
-    pendingMap_.clear();
-    stats_.pendingTasks = 0;
   }
 
   void setHttpClient(Ptr<HttpClient> client) {
@@ -210,6 +225,13 @@ public:
   }
 
 private:
+  static void notifyCancelled(const Ptr<LoadTask> &task) {
+    if (task->callback) {
+      task->callback(Result<Ptr<Resource>>(ErrorCode::ResourceCancelled,
+                                           "Task cancelled"));
+    }
+  }
+
   void workerLoop() {
     while (true) {
       Ptr<LoadTask> task;
@@ -227,14 +249,17 @@ private:
 
         task = pendingTasks_.top();
         pendingTasks_.pop();
+        pendingMap_.erase(task->id);
+        stats_.pendingTasks--;
 
         if (task->cancelled) {
-          stats_.pendingTasks--;
+          stats_.cancelledTasks++;
+          lock.unlock();
+          notifyCancelled(task);
           continue;
         }
 
         activeTasks_[task->id] = task;
-        stats_.pendingTasks--;
         stats_.activeTasks++;
         stats_.maxConcurrent =
             std::max(stats_.maxConcurrent, stats_.activeTasks);
@@ -318,6 +343,13 @@ private:
 
     auto &response = responseResult.unwrap();
 
+    // Cache before the body and headers are moved into the resource; caching
+    // afterwards stored an empty body without its Cache-Control headers
+    if (task->options.useCache && cache_ && response.ok() &&
+        response.isCacheable()) {
+      cache_->put(task->url, response);
+    }
+
     resource->data = std::move(response.body);
     resource->mimeType = response.mimeType();
     resource->charset = response.charset();
@@ -349,10 +381,6 @@ private:
         resource->errorMessage = processResult.errorMessage();
         return resource;
       }
-    }
-
-    if (task->options.useCache && cache_ && response.isCacheable()) {
-      cache_->put(task->url, response);
     }
 
     resource->state = LoadState::Loaded;

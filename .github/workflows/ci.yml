@@ -84,7 +84,7 @@ jobs:
     - name: Run Tests (ctest)
       working-directory: build
       # 失败时显示详细日志；同时输出 JUnit 报告供上传
-      run: ctest -C Release --output-on-failure --output-junit test-results.xml
+      run: ctest -C Release --output-on-failure --timeout 120 --output-junit test-results.xml
 
     # --- 上传测试结果（JUnit） ---
     - name: Upload Test Results
@@ -146,7 +146,7 @@ jobs:
 
     - name: Run Tests (ctest)
       working-directory: build
-      run: ctest -C ${{ matrix.build_type }} --output-on-failure
+      run: ctest -C ${{ matrix.build_type }} --output-on-failure --timeout 120
 
   # ── 编译器矩阵：Clang ──────────────────────────────────────
   linux-clang:
@@ -175,7 +175,7 @@ jobs:
 
     - name: Run Tests (ctest)
       working-directory: build
-      run: ctest -C Release --output-on-failure
+      run: ctest -C Release --output-on-failure --timeout 120
 
   # ── 覆盖率报告（GCC + gcovr） ──────────────────────────────
   coverage:
@@ -201,7 +201,7 @@ jobs:
 
     - name: Run Tests (ctest)
       working-directory: build
-      run: ctest -C Debug --output-on-failure
+      run: ctest -C Debug --output-on-failure --timeout 120
 
     - name: Generate Coverage Report
       run: |

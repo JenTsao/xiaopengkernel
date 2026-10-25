@@ -179,12 +179,35 @@ private:
     std::string urlStr = request.url.toString();
     curl_easy_setopt(curl, CURLOPT_URL, urlStr.c_str());
 
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,
-                     methodToString(request.method).c_str());
+    // GET/HEAD/POST use libcurl's native options. CURLOPT_CUSTOMREQUEST only
+    // replaces the method string: a custom "HEAD" still waits for a body
+    // (hanging until the timeout) and a custom "POST" keeps POST across a
+    // 303 redirect instead of switching to GET.
+    switch (request.method) {
+    case HttpMethod::Get:
+      curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+      break;
+    case HttpMethod::Head:
+      curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+      break;
+    case HttpMethod::Post:
+      curl_easy_setopt(curl, CURLOPT_POST, 1L);
+      if (request.body.empty()) {
+        // Without POSTFIELDS libcurl would read the body from stdin
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
+      }
+      break;
+    default:
+      curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,
+                       methodToString(request.method).c_str());
+      break;
+    }
 
     if (!request.body.empty()) {
       curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.data());
-      curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, request.body.size());
+      curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
+                       static_cast<long>(request.body.size()));
     }
 
     outHeaders = nullptr;
@@ -318,6 +341,14 @@ private:
     auto *headers = static_cast<HttpHeaders *>(userdata);
 
     std::string_view header(ptr, totalSize);
+
+    // With FOLLOWLOCATION every hop's headers arrive here; a new status line
+    // starts a new response, so only the final response's headers remain
+    // (otherwise get("Content-Type") returned the redirect's value)
+    if (header.size() >= 5 && header.substr(0, 5) == "HTTP/") {
+      headers->clear();
+      return totalSize;
+    }
 
     auto colonPos = header.find(':');
     if (colonPos != std::string_view::npos) {

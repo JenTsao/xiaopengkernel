@@ -4,8 +4,13 @@
 #include "http_message.hpp"
 #include "types.hpp"
 #include "url.hpp"
+#include <chrono>
+#include <ctime>
+#include <iomanip>
 #include <list>
+#include <optional>
 #include <shared_mutex>
+#include <sstream>
 
 namespace xiaopeng {
 namespace loader {
@@ -31,7 +36,9 @@ struct CacheEntry {
     return std::chrono::steady_clock::now() > expiresAt;
   }
 
-  bool isFresh() const { return !isExpired(); }
+  // A response marked no-cache / must-revalidate is never usable without a
+  // validation round trip, so it does not count as fresh
+  bool isFresh() const { return !needsRevalidation(); }
 
   bool needsRevalidation() const { return mustRevalidate || isExpired(); }
 
@@ -225,9 +232,18 @@ public:
   void updateFromValidation(const Url &url, CacheEntry &entry,
                             const HttpResponse &response) {
     if (response.statusCode == HttpStatusCode::NotModified) {
-      entry.createdAt = std::chrono::steady_clock::now();
-      entry.expiresAt = calculateExpiry(response);
-      entry.hitCount++;
+      // `entry` is the caller's copy from get(); refresh the stored one
+      std::unique_lock<std::shared_mutex> lock(mutex_);
+      auto it = cache_.find(CacheKey{url.toString(), ""});
+      if (it == cache_.end())
+        return;
+      auto &stored = it->second;
+      stored->createdAt = std::chrono::steady_clock::now();
+      stored->expiresAt = calculateExpiry(response);
+      stored->hitCount++;
+      touchEntry(stored);
+      entry.createdAt = stored->createdAt;
+      entry.expiresAt = stored->expiresAt;
       return;
     }
 
@@ -273,26 +289,81 @@ private:
 
     auto cc = response.cacheControl();
     entry->mustRevalidate = cc.find("must-revalidate") != std::string::npos ||
-                            cc.find("proxy-revalidate") != std::string::npos;
+                            cc.find("proxy-revalidate") != std::string::npos ||
+                            cc.find("no-cache") != std::string::npos;
     entry->noStore = cc.find("no-store") != std::string::npos;
 
     return entry;
   }
 
   TimePoint calculateExpiry(const HttpResponse &response) const {
+    auto now = std::chrono::steady_clock::now();
+    long long lifetime = 0; // seconds
+
     auto maxAge = response.maxAge();
-
     if (maxAge) {
-      auto ttl = std::min(*maxAge, config_.maxTtl);
-      return std::chrono::steady_clock::now() + ttl;
+      lifetime = maxAge->count();
+    } else if (auto expires = response.headers.get("expires")) {
+      // A present Expires wins over heuristics; an invalid date is expired
+      auto when = parseHttpDate(*expires);
+      lifetime = when ? *when - wallClockSeconds() : 0;
+    } else {
+      // Heuristic freshness (RFC 7234 §4.2.2): 10% of the time since
+      // Last-Modified, bounded by the default TTL; without a validator the
+      // response is stale immediately instead of being trusted for 1 hour
+      auto lastModified = parseHttpDate(response.lastModified());
+      if (lastModified) {
+        auto age = wallClockSeconds() - *lastModified;
+        lifetime = std::min<long long>(std::max<long long>(age / 10, 0),
+                                       config_.defaultTtl.count());
+      }
     }
 
-    auto lastMod = response.lastModified();
-    if (!lastMod.empty()) {
-      return std::chrono::steady_clock::now() + config_.defaultTtl;
+    if (lifetime > 0) {
+      // Age already consumed part of the freshness lifetime
+      if (auto age = response.headers.get("age")) {
+        try {
+          lifetime -= std::stoll(*age);
+        } catch (...) {
+        }
+      }
     }
 
-    return std::chrono::steady_clock::now() + config_.defaultTtl;
+    auto ttl = std::chrono::seconds(
+        std::min<long long>(std::max<long long>(lifetime, 0),
+                            config_.maxTtl.count()));
+    return now + ttl;
+  }
+
+  static long long wallClockSeconds() {
+    return static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+  }
+
+  // HTTP-date in IMF-fixdate form ("Sun, 06 Nov 1994 08:49:37 GMT") as Unix
+  // seconds, computed without timegm/mktime (TZ independent)
+  static std::optional<long long> parseHttpDate(const std::string &value) {
+    std::tm tm{};
+    std::istringstream ss(value);
+    ss >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S");
+    if (ss.fail())
+      return std::nullopt;
+
+    int year = tm.tm_year + 1900;
+    const unsigned month = static_cast<unsigned>(tm.tm_mon + 1);
+    const unsigned day = static_cast<unsigned>(tm.tm_mday);
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(year - era * 400);
+    const unsigned doy =
+        (153 * (month + (month > 2 ? -3u : 9u)) + 2) / 5 + day - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const long long days =
+        static_cast<long long>(era) * 146097 + static_cast<long long>(doe) -
+        719468;
+    return days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
   }
 
   void touchEntry(Ptr<CacheEntry> entry) {
